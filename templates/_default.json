@@ -1,0 +1,23 @@
+{
+  "sysHead" : {
+    "seqNo" : "${seqNo}",
+    "subSeqNo" : "${subSeqNo}",
+    "tranDate" : "${tranDate}",
+    "tranTimestamp" : "${tranTimestamp}",
+    "branchId" : "${branchId}",
+    "userId" : "${userId}",
+    "userLang" : "CHINESE",
+    "moduleId" : "CL",
+    "sceneId" : "01",
+    "serverId" : "127.0.0.1",
+    "sourceType" : "MT",
+    "authFlag" : "N"
+  },
+  "appHead" : {
+    "currentNum" : "0",
+    "pageEnd" : "0",
+    "pageStart" : "0",
+    "pgupOrPgdn" : "0",
+    "totalNum" : "-1"
+  }
+}

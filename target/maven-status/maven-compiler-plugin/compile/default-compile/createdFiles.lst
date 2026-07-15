@@ -1,0 +1,6 @@
+com\mcp\scanner\SchemaLoadCompleteEvent.class
+com\mcp\tool\SchemaLoadCompleteListener.class
+com\mcp\config\ServiceRouter.class
+com\mcp\config\ServiceRegistry.class
+com\mcp\config\ServiceInstance.class
+com\mcp\config\ServiceInstance$Comet.class

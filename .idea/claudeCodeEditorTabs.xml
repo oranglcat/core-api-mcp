@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ClaudeCodeEditorTabs">
+    <option name="activeSessionId" value="c8df404c-1ce2-48ec-8b19-46b439729344" />
+    <option name="openSessionIds">
+      <list>
+        <option value="c8df404c-1ce2-48ec-8b19-46b439729344" />
+      </list>
+    </option>
+    <option name="sessionPaths">
+      <map>
+        <entry key="c8df404c-1ce2-48ec-8b19-46b439729344" value="/sessions/c15ec228-f956-40a6-8d4c-47e63c4d0d08" />
+      </map>
+    </option>
+    <option name="sessionTitles">
+      <map>
+        <entry key="c8df404c-1ce2-48ec-8b19-46b439729344" value="我想改造此mcp，目前mcp是写死后端地址的，我想从nacos上加载服务，并且实现一个开关过滤服务的" />
+      </map>
+    </option>
+  </component>
+</project>

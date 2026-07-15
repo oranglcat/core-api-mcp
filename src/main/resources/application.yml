@@ -1,0 +1,85 @@
+spring:
+  ai:
+    mcp:
+      server:
+        transport: SSE
+        name: mcp-adapter
+        version: 1.0.0
+      servlet:
+        path: /mcp
+
+server:
+  port: 8124
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
+
+# 原 Spring Boot 服务的连接信息
+service:
+  original:
+    url: http://127.0.0.1:9020
+    connect-timeout: 5000       # 连接超时（毫秒）
+    read-timeout: 30000         # 读取超时（毫秒）
+    # 认证配置（按需取消注释）
+    # auth:
+    #   enabled: true
+    #   type: bearer     # basic | bearer
+    #   username:
+    #   password:
+    #   token: your-token
+
+  # 标准报文格式（金融类系统固定 JSON 报文模板）
+  # 每个接口可单独在 template-dir 下创建 *.json 模板，按 URL 路径匹配
+  message-format:
+    enabled: true
+    template-dir: ./templates               # 存放各接口报文模板的目录
+    # 以下 sys-head / app-head 为兜底配置（当 per-API 模板不存在时使用）
+    sys-head:
+      branchId: "351002"
+      userId: QQ
+      userLang: CHINESE
+      moduleId: CL
+      sceneId: "01"
+      sourceType: MT
+      authFlag: N
+    app-head:
+      currentNum: "0"
+      pageEnd: "0"
+      pageStart: "0"
+      pgupOrPgdn: "0"
+      totalNum: "-1"
+
+  # ★ 多服务注册表（微服务集群模式）
+  # 启用后，MCP Adapter 自动根据 API 路径前缀路由到对应的后端服务，
+  # 并从每个服务独立的 Comet 平台加载接口定义。
+  # 未配置时自动降级为单服务模式（使用下方 service.comet.* 配置）。
+  registry:
+    services:
+      # - id: service-pf
+      #   base-url: http://10.127.7.141:9021
+      #   route-patterns:
+      #     - /pf/**
+      #   comet:
+      #     host: 10.127.7.141
+      #     port: 9120
+      #
+      # - id: service-rib
+      #   base-url: http://10.127.7.141:9022
+      #   route-patterns:
+      #     - /rib/**
+      #   comet:
+      #     host: 10.127.7.141
+      #     port: 9122
+
+  # Comet 平台配置（单服务模式 / 默认兜底）
+  # 当 service.registry.services 未配置时使用此地址
+  comet:
+    enabled: true
+    base-url: http://10.127.7.141:9020  # ← Comet 平台地址
+    timeout: 5000

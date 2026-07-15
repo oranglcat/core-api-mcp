@@ -1,0 +1,40 @@
+{
+  "sysHead": {
+    "seqNo": "${seqNo}",
+    "subSeqNo": "${subSeqNo}",
+    "tranDate": "${tranDate}",
+    "tranTimestamp": "${tranTimestamp}",
+    "branchId": "351001",
+    "destBranchNo": "351001",
+    "sourceBranchNo": "351001",
+    "sourceType": "MT",
+    "messageCode": "0500",
+    "messageType": "1200",
+    "serviceCode": "MbsdCore",
+    "programId": "3541",
+    "sceneId": "01",
+    "userId": "CS003",
+    "userLang": "CHINESE",
+    "apprFlag": "",
+    "apprUserId": "",
+    "authFlag": "N",
+    "authUserId": "",
+    "tranMode": "ONLINE"
+  },
+  "appHead": {
+    "currentNum": "0",
+    "pageEnd": "0",
+    "pageStart": "0",
+    "pgupOrPgdn": "0",
+    "totalFlag": "E",
+    "totalNum": "-1"
+  },
+  "localHead": {},
+  "mapping": {},
+  "serviceId": "MbsdCore-1200-0500",
+  "doACCheck": false,
+  "doCheck": true,
+  "doSubmit": false,
+  "subRequest": false,
+  "submitSeqNo": 0
+}

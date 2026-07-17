@@ -104,13 +104,6 @@ public class HttpForwarder {
     }
 
     /**
-     * 兼容无 requiredFields 参数的重载（保持向后兼容）
-     */
-    public String forwardPost(String apiPath, Map<String, Object> params) {
-        return forwardPost(apiPath, params, null);
-    }
-
-    /**
      * 将异常转换为对 LLM 友好的中文消息，隐藏内部实现细节。
      */
     private String resolveUserMessage(Exception e) {

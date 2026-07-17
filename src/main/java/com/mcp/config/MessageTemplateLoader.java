@@ -162,10 +162,8 @@ public class MessageTemplateLoader {
         path = path.trim();
         if (path.startsWith("/")) path = path.substring(1);
         if (path.endsWith("/")) path = path.substring(0, path.length() - 1);
-        // 路径分隔符转下划线
-        path = path.replaceAll("[/\\\\-]", "_");
-        // 去连续下划线
-        path = path.replaceAll("_+", "_");
+        // 路径分隔符转下划线（合并连续匹配）
+        path = path.replaceAll("[/\\\\-]+", "_");
         return path;
     }
 

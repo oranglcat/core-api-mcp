@@ -2,6 +2,8 @@ F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\AppConfi
 F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\CometConfig.java
 F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\MessageFormatConfig.java
 F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\MessageTemplateLoader.java
+F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\NacosConfig.java
+F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\NacosServiceDiscoverer.java
 F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\ServiceInstance.java
 F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\ServiceRegistry.java
 F:\dcits\核心业务接口MCP\mcp-adapter\src\main\java\com\mcp\config\ServiceRouter.java

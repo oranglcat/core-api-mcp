@@ -61,47 +61,22 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
 
     @Override
     public ToolCallback[] getToolCallbacks() {
-        // 1. 检查 Comet 是否可用
-        if (cometLoader == null || !cometLoader.isLoaded()) {
-            if (cometLoader != null && cometLoader.isLoadingInProgress()) {
-                // 多服务异步模式：后台加载未完成，工具将在加载完成后动态注册
-                log.info("多服务 Schema 后台加载中 [{}]，"
-                    + "getToolCallbacks() 返回空——等待 SchemaLoadCompleteEvent 事件触发动态注册",
-                    cometLoader.getLoadSummary());
-            } else if (cometLoader != null) {
-                log.warn("Comet schema 加载失败或未配置，跳过工具注册");
-            } else {
-                log.warn("Comet schema loader 不可用（未配置 Comet），跳过工具注册");
-            }
+        if (cometLoader == null) {
+            log.warn("Comet schema loader 不可用（未配置 Comet），跳过工具注册");
             return new ToolCallback[0];
         }
 
-        // ======== 单服务同步模式：直接构建工具 ========
+        // 使用当前已加载的 Schema 构建查找表（可能是 partial，异步加载中也会返回非空工具）
+        rebuildCodeToSchemaMap(cometLoader.getAllSchemas());
 
-        Map<String, ApiParamSchema> allSchemas = cometLoader.getAllSchemas();
-        log.info("Comet schema 总览: {} 个接口定义, 服务加载摘要: {}",
-            allSchemas.size(), cometLoader.getLoadSummary());
-
-        if (allSchemas.isEmpty()) {
-            log.warn("Comet 接口列表为空，不注册任何工具");
-            return new ToolCallback[0];
-        }
-
-        // 2. 构建 apiCode → ApiParamSchema 查找表
-        rebuildCodeToSchemaMap(allSchemas);
-        int codeCount = codeToSchemaMap.size();
-        int skippedCount = allSchemas.size() - codeCount;
-        log.info("查找表构建完成: {} 个 apiCode 可注册 (跳过 {} 个无 className/methodName 的接口)",
-            codeCount, skippedCount);
-
-        // 注册两个 Tool：统一调用 + 接口搜索
-        ToolCallback unifiedTool = buildUnifiedTool(codeToSchemaMap);
-        ToolCallback searchTool = buildSearchTool(codeToSchemaMap);
-        log.info("✅ MCP 工具注册完成 (单服务模式): {} ({} 个接口, {} 个服务), {}",
-            UNIFIED_TOOL_NAME, codeCount,
-            cometLoader.getLoadSummary(),
+        log.info("构建 MCP 工具: {} (已加载 {} 个接口, 加载状态: {}), {}",
+            UNIFIED_TOOL_NAME, codeToSchemaMap.size(),
+            cometLoader.isLoaded() ? "完成"
+                : (cometLoader.isLoadingInProgress() ? "加载中" : "未加载"),
             SEARCH_TOOL_NAME);
 
+        ToolCallback unifiedTool = buildUnifiedTool();
+        ToolCallback searchTool = buildSearchTool();
         return new ToolCallback[] { unifiedTool, searchTool };
     }
 
@@ -118,7 +93,7 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
      * 增量刷新 codeToSchema 查找表——从已加载的 Schema 中补充新条目。
      * 用于按需加载场景：后台加载完成后，将新增的 Schema 反映到查找表中。
      */
-    private void refreshCodeToSchemaMap() {
+    void refreshCodeToSchemaMap() {
         if (cometLoader == null) return;
         Map<String, ApiParamSchema> allSchemas = cometLoader.getAllSchemas();
         int before = codeToSchemaMap.size();
@@ -176,10 +151,14 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
      * 创建统一的 ToolCallback。
      * 该工具接受 apiCode（选择接口）+ params（业务参数），
      * 内部根据 apiCode 映射到具体的接口 URL 并转发请求。
+     * <p>
+     * 注意：description 和 inputSchema 采用紧凑模式（不枚举接口列表），
+     * 引导 LLM 先使用 searchBusinessApi 搜索再调用。工具内部引用
+     * {@link #codeToSchemaMap} 类字段，后台加载完成后自动可见新接口。
      */
-    private ToolCallback buildUnifiedTool(Map<String, ApiParamSchema> codeToSchema) {
-        String description = buildUnifiedDescription(codeToSchema);
-        String inputSchemaJson = buildUnifiedInputSchema(codeToSchema);
+    private ToolCallback buildUnifiedTool() {
+        String description = buildUnifiedDescription();
+        String inputSchemaJson = buildUnifiedInputSchema();
 
         return new ToolCallback() {
             @Override
@@ -200,24 +179,24 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
                     // 提取 apiCode
                     String apiCode = args != null ? (String) args.get("apiCode") : null;
                     if (apiCode == null || apiCode.isBlank()) {
-                        return "错误: 缺少必要参数 'apiCode'。可用接口: "
-                            + String.join(", ", codeToSchema.keySet());
+                        return "错误: 缺少必要参数 'apiCode'。"
+                            + "请先调用 searchBusinessApi 搜索获取 apiCode。";
                     }
 
-                    // 查找对应的 Schema
-                    ApiParamSchema schema = codeToSchema.get(apiCode);
+                    // 查找对应的 Schema（类字段引用，后台加载完成后自动可见）
+                    ApiParamSchema schema = codeToSchemaMap.get(apiCode);
                     if (schema == null) {
                         // 后台加载可能尚未完成，尝试按需同步加载
                         if (cometLoader != null && cometLoader.isLoadingInProgress()) {
                             log.info("apiCode [{}] 未命中，触发按需加载...", apiCode);
                             cometLoader.loadRemainingOnDemand();
                             refreshCodeToSchemaMap();
-                            schema = codeToSchema.get(apiCode);
+                            schema = codeToSchemaMap.get(apiCode);
                         }
                     }
                     if (schema == null) {
-                        return "错误: 未知的 apiCode '" + apiCode + "'。可用接口: "
-                            + String.join(", ", codeToSchema.keySet());
+                        return "错误: 未知的 apiCode '" + apiCode + "'。"
+                            + "请先调用 searchBusinessApi 搜索正确的 apiCode。";
                     }
 
                     // 提取业务参数
@@ -255,7 +234,7 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
      * 在 apiName、remark、className、methodName、入参名和入参描述中多字段关键词搜索，
      * 返回匹配的接口详情（含入参信息）。LLM 不确定 apiCode 时应先调用此工具。
      */
-    private ToolCallback buildSearchTool(Map<String, ApiParamSchema> codeToSchema) {
+    private ToolCallback buildSearchTool() {
         String description = "搜索后端业务接口。根据关键词(如接口名、业务描述、功能名称)查找匹配的接口，"
             + "返回接口编码(apiCode)和详细参数信息。找到准确的 apiCode 后再调用 invokeBusinessApi。";
 
@@ -282,7 +261,7 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
                     if (keywords == null || keywords.isBlank()) {
                         return "请提供搜索关键词。";
                     }
-                    return searchApis(keywords.trim(), codeToSchema);
+                    return searchApis(keywords.trim());
                 } catch (Exception e) {
                     log.error("searchBusinessApi failed: {}", e.getMessage(), e);
                     return "搜索失败，请稍后重试。";
@@ -299,13 +278,13 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
     /**
      * 执行多字段关键词搜索，返回格式化的匹配结果。
      */
-    private String searchApis(String keywords, Map<String, ApiParamSchema> codeToSchema) {
+    private String searchApis(String keywords) {
         String[] parts = keywords.toLowerCase().split("\\s+");
 
         // 评分: 每个匹配 +1 分
         List<ScoredResult> scored = new ArrayList<>();
 
-        for (Map.Entry<String, ApiParamSchema> entry : codeToSchema.entrySet()) {
+        for (Map.Entry<String, ApiParamSchema> entry : codeToSchemaMap.entrySet()) {
             String apiCode = entry.getKey();
             ApiParamSchema s = entry.getValue();
             int score = 0;
@@ -411,127 +390,31 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
         }
     }
 
-    // ========== 描述生成 ==========
-
-    /** 每组最多展示的接口明细数，超过则折叠显示 */
-    private static final int MAX_API_PER_GROUP = 5;
+    // ========== 紧凑描述生成 ==========
 
     /**
-     * 构建统一 Tool 的描述。
+     * 构建统一 Tool 的紧凑描述（不枚举接口列表）。
      * <p>
-     * 按业务模块分组展示接口列表，每条包含 apiCode、中文名、业务描述（remark）、
-     * 以及核心入参摘要。末尾引导 LLM 先搜索后调用。
+     * 改为固定字符串，引导 LLM 先使用 searchBusinessApi 搜索接口再调用。
+     * 工具定义大小 O(1)，不随接口数量增长。
      */
-    private String buildUnifiedDescription(Map<String, ApiParamSchema> codeToSchema) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("调用后端业务接口（POST）。通过 apiCode 选择要调用的接口，");
-        sb.append("在 params 中传入该接口的业务参数（即报文 body 内容）。\n\n");
-        sb.append("**如果对使用哪个 apiCode 不确定，请先调用 searchBusinessApi 工具搜索接口，");
-        sb.append("找到准确的 apiCode 后再调用本工具。**\n\n");
-        sb.append("**重要规则：根据问题确定唯一的 apiCode 后只调用一次，不要遍历多个接口。**\n\n");
-
-        // 按 URL 业务分组
-        Map<String, List<Map.Entry<String, ApiParamSchema>>> groups = new LinkedHashMap<>();
-        for (Map.Entry<String, ApiParamSchema> entry : codeToSchema.entrySet()) {
-            String groupKey = extractGroupKey(entry.getValue());
-            groups.computeIfAbsent(groupKey, k -> new ArrayList<>()).add(entry);
-        }
-
-        sb.append("可用接口（共 ").append(codeToSchema.size()).append(" 个，按模块分组）:\n");
-        for (Map.Entry<String, List<Map.Entry<String, ApiParamSchema>>> group : groups.entrySet()) {
-            List<Map.Entry<String, ApiParamSchema>> members = group.getValue();
-            members.sort(Map.Entry.comparingByKey());
-
-            sb.append("\n【").append(group.getKey()).append("】(").append(members.size()).append(" 个):\n");
-            int shown = 0;
-            for (Map.Entry<String, ApiParamSchema> entry : members) {
-                if (shown >= MAX_API_PER_GROUP) {
-                    sb.append("  ... 另有 ").append(members.size() - MAX_API_PER_GROUP).append(" 个接口未列出\n");
-                    break;
-                }
-                String code = entry.getKey();
-                ApiParamSchema s = entry.getValue();
-                // A1: apiCode (apiName) - remark
-                sb.append("  - ").append(code);
-                if (s.apiName() != null && !s.apiName().isBlank()) {
-                    sb.append(" (").append(s.apiName()).append(")");
-                }
-                if (s.remark() != null && !s.remark().isBlank()) {
-                    sb.append(" - ").append(s.remark().replaceAll("\\s+", " "));
-                }
-                sb.append("\n");
-                // A2: 入参摘要（最多5个）
-                List<FieldDef> inputs = s.inputs();
-                if (!inputs.isEmpty()) {
-                    sb.append("    入参: ");
-                    List<String> paramParts = new ArrayList<>();
-                    int paramCount = 0;
-                    for (FieldDef f : inputs) {
-                        if (paramCount >= 5) {
-                            paramParts.add("...");
-                            break;
-                        }
-                        StringBuilder p = new StringBuilder(f.name());
-                        if (f.description() != null && !f.description().isBlank()) {
-                            p.append("(").append(f.description()).append(")");
-                        }
-                        if (f.required()) {
-                            p.append("[必填]");
-                        }
-                        paramParts.add(p.toString());
-                        paramCount++;
-                    }
-                    sb.append(String.join(", ", paramParts));
-                    if (inputs.size() > 5) {
-                        sb.append(" 共").append(inputs.size()).append("个参数");
-                    }
-                    sb.append("\n");
-                }
-                shown++;
-            }
-        }
-
-        sb.append("\n使用说明:\n");
-        sb.append("1. 不确定用哪个 apiCode 时，先调用 searchBusinessApi 搜索\n");
-        sb.append("2. 确定 apiCode 后，在 params 中传入对应的业务参数\n");
-        sb.append("3. 如果不需要参数，可不传 params 或传空对象 {}\n");
-        sb.append("4. **调用成功后直接根据返回数据回答用户，禁止继续调用其他接口**");
-
-        return sb.toString();
+    private String buildUnifiedDescription() {
+        return "调用后端业务接口（POST）。通过 apiCode 选择要调用的接口，"
+            + "在 params 中传入该接口的业务参数（即报文 body 内容）。\n\n"
+            + "**重要：如果不确定使用哪个 apiCode，必须先调用 searchBusinessApi 工具搜索接口，"
+            + "找到准确的 apiCode 后再调用本工具。**\n\n"
+            + "**重要规则：根据问题确定唯一的 apiCode 后只调用一次，不要遍历多个接口。**\n\n"
+            + "使用说明:\n"
+            + "1. 不确定用哪个 apiCode 时，先调用 searchBusinessApi 搜索\n"
+            + "2. 确定 apiCode 后，在 params 中传入对应的业务参数\n"
+            + "3. 如果不需要参数，可不传 params 或传空对象 {}\n"
+            + "4. **调用成功后直接根据返回数据回答用户，禁止继续调用其他接口**";
     }
 
-    /**
-     * 从 URL 路径提取有业务含义的分组 key。
-     * 优先取 URL 倒数第二段有意义单词作为组名（如 /pf/inq/xxx/loan/query → loan），
-     * 兜底使用 className 字母前缀（如 core1200109445 → core）。
-     */
-    private String extractGroupKey(ApiParamSchema schema) {
-        // 策略 1: 从 URL 路径中提取倒数第二段有业务含义的单词
-        String url = schema.url();
-        if (url != null) {
-            String[] segments = url.split("/");
-            for (int i = segments.length - 2; i >= 1; i--) {
-                String seg = segments[i].trim();
-                if (seg.length() >= 2 && seg.matches("[a-zA-Z]{2,}")) {
-                    return seg;
-                }
-            }
-        }
-        // 策略 2: 兜底使用 className 字母前缀
-        String cn = schema.className();
-        if (cn == null || cn.isBlank()) return "其他";
-        String alphaPrefix = cn.trim().replaceAll("[^a-zA-Z].*$", "");
-        if (alphaPrefix.length() >= 2) return alphaPrefix;
-        return cn.trim().substring(0, Math.min(3, cn.trim().length()));
-    }
-
-    // ========== 入参 JSON Schema 生成 ==========
-
-    /** Schema 中 enum 列表截断阈值：超过该数量时不生成 enum，改为 description 提示 */
-    private static final int ENUM_TRUNCATE_THRESHOLD = 100;
+    // ========== 紧凑入参 JSON Schema 生成 ==========
 
     /**
-     * 构建统一 Tool 的 JSON Schema。
+     * 构建统一 Tool 的紧凑 JSON Schema（不生成 enum 列表）。
      * <p>
      * 结构：
      * <pre>
@@ -540,33 +423,20 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
      *   "params": { ... }                        // 业务参数
      * }
      * </pre>
-     * 当接口数量超过 {@link #ENUM_TRUNCATE_THRESHOLD} 时，不生成 enum 列表（避免 Schema 过大），
-     * 改为在 description 中提示 LLM 从可用接口列表中选择。
+     * apiCode 字段不生成 enum 列表（避免 Schema 过大），
+     * 在 description 中引导 LLM 先搜索再调用。
      */
-    private String buildUnifiedInputSchema(Map<String, ApiParamSchema> codeToSchema) {
-        List<String> sortedCodes = codeToSchema.keySet().stream()
-            .sorted()
-            .toList();
-
+    private String buildUnifiedInputSchema() {
         Map<String, Object> schema = new LinkedHashMap<>();
         schema.put("type", "object");
 
         Map<String, Object> properties = new LinkedHashMap<>();
 
-        // apiCode 字段
+        // apiCode 字段——始终紧凑，不生成 enum
         Map<String, Object> apiCodeProp = new LinkedHashMap<>();
         apiCodeProp.put("type", "string");
-        apiCodeProp.put("description", "接口编码，格式：{业务类名}_{方法名}，例如 " + sortedCodes.get(0));
-
-        if (sortedCodes.size() <= ENUM_TRUNCATE_THRESHOLD) {
-            // 接口数量适中→生成完整 enum 列表
-            apiCodeProp.put("enum", sortedCodes);
-        } else {
-            // 接口过多→不在 enum 中列出，减少 Schema 大小
-            apiCodeProp.put("description",
-                "接口编码，格式：{业务类名}_{方法名}，共 " + sortedCodes.size()
-                    + " 个可用接口。请参考 Tool description 中的接口列表选择正确的 apiCode。");
-        }
+        apiCodeProp.put("description",
+            "接口编码，格式：{业务类名}_{方法名}。请先调用 searchBusinessApi 搜索获取准确的 apiCode。");
         properties.put("apiCode", apiCodeProp);
 
         // params 字段

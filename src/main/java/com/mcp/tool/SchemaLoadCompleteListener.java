@@ -2,30 +2,22 @@ package com.mcp.tool;
 
 import com.mcp.scanner.CometApiSchemaLoader;
 import com.mcp.scanner.SchemaLoadCompleteEvent;
-import io.modelcontextprotocol.server.McpServerFeatures;
 import io.modelcontextprotocol.server.McpSyncServer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.mcp.McpToolUtils;
-import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.ApplicationListener;
 import org.springframework.stereotype.Component;
-
-import java.util.List;
 
 /**
  * Schema 加载完成事件监听器。
  * <p>
  * 监听 {@link SchemaLoadCompleteEvent}，在异步多服务 Schema 加载完成后，
- * 通过 {@link McpSyncServer#addTool} 动态注册 MCP 工具到运行中的 MCP Server，
- * 并通知客户端刷新工具列表。
+ * 刷新已注册工具的内部查找表（codeToSchemaMap），并通知 MCP 客户端工具列表已变更。
  * <p>
- * 此组件从 {@link DynamicToolRegistrar} 中拆分出来，目的是打破循环依赖：
- * <pre>
- *   DynamicToolRegistrar → (原) McpSyncServer → syncTools → DynamicToolRegistrar
- * </pre>
- * 现在 {@link DynamicToolRegistrar} 不再依赖 McpSyncServer，而此监听器独立处理动态注册。
+ * 注意：工具本身已在 {@link DynamicToolRegistrar#getToolCallbacks()} 中注册，
+ * 此处不再重复 addTool()。工具内部引用 {@code codeToSchemaMap} 类字段，
+ * 调用 refreshCodeToSchemaMap() 后数据自动可见。
  */
 @Component
 public class SchemaLoadCompleteListener implements ApplicationListener<SchemaLoadCompleteEvent> {
@@ -35,9 +27,6 @@ public class SchemaLoadCompleteListener implements ApplicationListener<SchemaLoa
     private final McpSyncServer mcpSyncServer;
     private final DynamicToolRegistrar dynamicToolRegistrar;
     private final CometApiSchemaLoader cometLoader;
-
-    /** 防止同一事件多次触发重复注册 */
-    private volatile boolean toolsRegistered = false;
 
     public SchemaLoadCompleteListener(
             @Autowired(required = false) McpSyncServer mcpSyncServer,
@@ -50,49 +39,26 @@ public class SchemaLoadCompleteListener implements ApplicationListener<SchemaLoa
 
     @Override
     public void onApplicationEvent(SchemaLoadCompleteEvent event) {
-        // 防重复
-        if (toolsRegistered) {
-            log.debug("工具已动态注册，忽略重复事件");
-            return;
-        }
-
         if (mcpSyncServer == null) {
-            log.warn("McpSyncServer 不可用（非标准 MCP 传输？），无法动态注册工具");
+            log.warn("McpSyncServer 不可用（非标准 MCP 传输？），跳过动态刷新");
             return;
         }
 
         if (!cometLoader.isLoaded()) {
-            log.warn("收到 Schema 完成事件但加载状态异常，跳过动态工具注册");
+            log.warn("收到 Schema 完成事件但加载状态异常，跳过刷新");
             return;
         }
 
-        // 通过 DynamicToolRegistrar 获取已构建的 ToolCallback
-        ToolCallback[] callbacks = dynamicToolRegistrar.getToolCallbacks();
-        if (callbacks.length == 0) {
-            log.warn("getToolCallbacks() 返回空，跳过动态注册。服务加载摘要: {}",
-                cometLoader.getLoadSummary());
-            return;
-        }
+        // 刷新已注册 ToolCallback 中的 codeToSchemaMap（工具在 getToolCallbacks() 中已注册）
+        dynamicToolRegistrar.refreshCodeToSchemaMap();
 
+        // 通知已连接客户端：工具列表已变更（工具名未变，但搜索范围已完整）
         try {
-            // 转换为 McpServer SyncToolSpecification 并注册
-            List<McpServerFeatures.SyncToolSpecification> specs =
-                McpToolUtils.toSyncToolSpecifications(callbacks);
-
-            for (McpServerFeatures.SyncToolSpecification spec : specs) {
-                mcpSyncServer.addTool(spec);
-            }
-
-            // 通知所有已连接客户端：工具列表已变更
             mcpSyncServer.notifyToolsListChanged();
-
-            log.info("✅ 动态注册 MCP 工具完成: {} 个工具 ({}), 已通知客户端刷新",
-                callbacks.length, cometLoader.getLoadSummary());
-
-            toolsRegistered = true;
-
+            log.info("Schema 加载完成，已刷新 codeToSchemaMap 并通知客户端: {}",
+                cometLoader.getLoadSummary());
         } catch (Exception e) {
-            log.error("动态注册 MCP 工具失败: {}", e.getMessage(), e);
+            log.error("通知客户端工具列表变更失败: {}", e.getMessage(), e);
         }
     }
 }

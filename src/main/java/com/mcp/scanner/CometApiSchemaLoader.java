@@ -1,6 +1,7 @@
 package com.mcp.scanner;
 
 import com.mcp.config.CometConfig;
+import com.mcp.config.NacosConfig;
 import com.mcp.config.ServiceInstance;
 import com.mcp.config.ServiceRegistry;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -15,10 +16,13 @@ import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.annotation.DependsOn;
+import org.springframework.util.AntPathMatcher;
 
 /**
  * Comet 接口文档平台 REST API 加载器。
@@ -34,12 +38,14 @@ import org.springframework.context.ApplicationEventPublisher;
  * 当后台加载尚未完成时，可通过 {@link #loadRemainingOnDemand()} 进行按需同步加载。
  */
 @Component
+@DependsOn("nacosServiceDiscoverer")
 public class CometApiSchemaLoader {
 
     private static final Logger log = LoggerFactory.getLogger(CometApiSchemaLoader.class);
 
     private final CometConfig cometConfig;
     private final ServiceRegistry serviceRegistry;
+    private final NacosConfig nacosConfig;
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
 
@@ -78,10 +84,12 @@ public class CometApiSchemaLoader {
 
     public CometApiSchemaLoader(CometConfig cometConfig,
                                 ServiceRegistry serviceRegistry,
+                                NacosConfig nacosConfig,
                                 ObjectMapper objectMapper,
                                 ApplicationEventPublisher eventPublisher) {
         this.cometConfig = cometConfig;
         this.serviceRegistry = serviceRegistry;
+        this.nacosConfig = nacosConfig;
         this.objectMapper = objectMapper;
         this.eventPublisher = eventPublisher;
 
@@ -106,6 +114,15 @@ public class CometApiSchemaLoader {
 
     private static final AtomicInteger counter = new AtomicInteger(0);
 
+    /** 防重复发布事件 */
+    private final AtomicBoolean eventPublished = new AtomicBoolean(false);
+
+    /** AntPath 模式匹配器（用于服务名 → Comet 端口匹配） */
+    private final AntPathMatcher pathMatcher = new AntPathMatcher();
+
+    /** 优雅关闭时等待线程池终止的超时秒数 */
+    private static final int SHUTDOWN_TIMEOUT_SECONDS = 3;
+
     /**
      * 应用启动时加载所有接口的参数定义。
      * <p>
@@ -121,7 +138,7 @@ public class CometApiSchemaLoader {
             && !cometConfig.getBaseUrl().isBlank();
 
         if (!hasMultiService && !hasSingleService) {
-            log.info("Comet 未配置（无 service.registry.services 或 service.comet.base-url），跳过 Schema 加载");
+            log.info("Comet 未配置（无 Nacos 服务或 service.comet.base-url），跳过 Schema 加载");
             this.loaded = false;
             this.loadingInProgress = false;
             return;
@@ -146,11 +163,8 @@ public class CometApiSchemaLoader {
             return;
         }
 
-        // ======== 多服务模式（异步并行，不阻塞启动） ========
-        List<ServiceInstance> services = serviceRegistry.getServices()
-            .stream()
-            .filter(s -> s.getComet() != null)
-            .collect(Collectors.toList());
+        // ======== 多服务模式（Nacos 动态发现，异步并行加载） ========
+        List<ServiceInstance> services = serviceRegistry.getServices();
 
         log.info("多服务模式：开始异步加载 {} 个服务的 Comet Schema（不阻塞启动）", services.size());
         this.loadingInProgress = true;
@@ -159,27 +173,47 @@ public class CometApiSchemaLoader {
             asyncExecutor.submit(() -> {
                 String serviceId = service.getId();
                 long start = System.currentTimeMillis();
+                boolean success = false;
+
+                // 1. 主尝试：使用 Nacos 实例端口
                 try {
-                    int count = loadFromSingleComet(service.getCometUrl(), serviceId);
+                    String cometUrl = buildCometUrl(service.getPort());
+                    int count = loadFromSingleComet(cometUrl, serviceId);
                     fullyLoadedServices.add(serviceId);
                     log.info("服务 [{}] Schema 加载完成 ({} 个接口, {}ms)",
                         serviceId, count, System.currentTimeMillis() - start);
+                    success = true;
                 } catch (Exception e) {
-                    failedServices.add(serviceId);
-                    log.error("服务 [{}] Schema 加载失败 ({}ms): {}",
-                        serviceId, System.currentTimeMillis() - start, e.getMessage());
-                } finally {
-                    // 检查是否所有服务都已加载完毕
-                    if (fullyLoadedServices.size() + failedServices.size() >= services.size()) {
-                        this.loaded = true;
-                        this.loadingInProgress = false;
-                        log.info("所有服务 Schema 加载完毕。成功: {}, 失败: {}",
-                            fullyLoadedServices.size(), failedServices.size());
-                        loadLatch.countDown();
-                        // 发布事件，触发动态工具注册
-                        eventPublisher.publishEvent(new SchemaLoadCompleteEvent(this));
+                    log.warn("服务 [{}] 主端口 {} 连接失败，尝试回退端口: {}",
+                        serviceId, service.getPort(), e.getMessage());
+                }
+
+                // 2. 回退尝试：使用配置的 comet-ports 映射端口
+                if (!success) {
+                    Integer fallbackPort = resolveCometPort(serviceId);
+                    if (fallbackPort != null && !fallbackPort.equals(service.getPort())) {
+                        try {
+                            String fallbackUrl = buildCometUrl(fallbackPort);
+                            int count = loadFromSingleComet(fallbackUrl, serviceId);
+                            fullyLoadedServices.add(serviceId);
+                            log.info("服务 [{}] Schema 加载完成 (回退端口 {}, {} 个接口, {}ms)",
+                                serviceId, fallbackPort, count, System.currentTimeMillis() - start);
+                            success = true;
+                        } catch (Exception e2) {
+                            log.error("服务 [{}] 回退端口 {} 也连接失败: {}",
+                                serviceId, fallbackPort, e2.getMessage());
+                        }
                     }
                 }
+
+                // 3. 记录失败
+                if (!success) {
+                    failedServices.add(serviceId);
+                    log.error("服务 [{}] Schema 加载失败 ({}ms)", serviceId, System.currentTimeMillis() - start);
+                }
+
+                // 4. 检查是否全部完成（仅首次触发）
+                checkAndFireCompletion(services.size());
             });
         }
 
@@ -449,14 +483,11 @@ public class CometApiSchemaLoader {
             .stream()
             .filter(s -> !fullyLoadedServices.contains(s.getId()))
             .filter(s -> !failedServices.contains(s.getId()))
-            .filter(s -> s.getComet() != null)
             .collect(Collectors.toList());
 
         if (pendingServices.isEmpty()) {
             // 可能所有服务都已加载完但 loadingInProgress 还没更新
-            this.loadingInProgress = false;
-            this.loaded = true;
-            loadLatch.countDown();
+            checkAndFireCompletion((int) serviceRegistry.getServices().size());
             return;
         }
 
@@ -464,27 +495,48 @@ public class CometApiSchemaLoader {
 
         for (ServiceInstance service : pendingServices) {
             String serviceId = service.getId();
+            long start = System.currentTimeMillis();
+            boolean success = false;
+
+            // 1. 主尝试：使用 Nacos 实例端口
             try {
-                long start = System.currentTimeMillis();
-                int count = loadFromSingleComet(service.getCometUrl(), serviceId);
+                String cometUrl = buildCometUrl(service.getPort());
+                int count = loadFromSingleComet(cometUrl, serviceId);
                 fullyLoadedServices.add(serviceId);
                 log.info("按需加载服务 [{}] 完成 ({} 个接口, {}ms)",
                     serviceId, count, System.currentTimeMillis() - start);
+                success = true;
             } catch (Exception e) {
+                log.warn("按需加载服务 [{}] 主端口 {} 连接失败，尝试回退端口: {}",
+                    serviceId, service.getPort(), e.getMessage());
+            }
+
+            // 2. 回退尝试：使用配置的 comet-ports 映射端口
+            if (!success) {
+                Integer fallbackPort = resolveCometPort(serviceId);
+                if (fallbackPort != null && !fallbackPort.equals(service.getPort())) {
+                    try {
+                        String fallbackUrl = buildCometUrl(fallbackPort);
+                        int count = loadFromSingleComet(fallbackUrl, serviceId);
+                        fullyLoadedServices.add(serviceId);
+                        log.info("按需加载服务 [{}] 完成 (回退端口 {}, {} 个接口, {}ms)",
+                            serviceId, fallbackPort, count, System.currentTimeMillis() - start);
+                        success = true;
+                    } catch (Exception e2) {
+                        log.error("按需加载服务 [{}] 回退端口 {} 也连接失败: {}",
+                            serviceId, fallbackPort, e2.getMessage());
+                    }
+                }
+            }
+
+            if (!success) {
                 failedServices.add(serviceId);
-                log.error("按需加载服务 [{}] 失败: {}", serviceId, e.getMessage());
+                log.error("按需加载服务 [{}] 失败 ({}ms)", serviceId, System.currentTimeMillis() - start);
             }
         }
 
         // 检查是否全部完成
-        long total = serviceRegistry.getServices().stream()
-            .filter(s -> s.getComet() != null).count();
-        if (fullyLoadedServices.size() + failedServices.size() >= total) {
-            this.loadingInProgress = false;
-            this.loaded = true;
-            loadLatch.countDown();
-            eventPublisher.publishEvent(new SchemaLoadCompleteEvent(this));
-        }
+        checkAndFireCompletion(serviceRegistry.getServices().size());
     }
 
     // ========== 工具方法 ==========
@@ -541,6 +593,45 @@ public class CometApiSchemaLoader {
         }
     }
 
+    /**
+     * 构建 Comet URL。
+     *
+     * @param port Comet 端口
+     * @return 完整的 Comet 基础 URL
+     */
+    private String buildCometUrl(int port) {
+        return "http://" + nacosConfig.getCometHost() + ":" + port;
+    }
+
+    /**
+     * 检查是否所有服务 Schema 均已加载完毕（成功 + 失败），
+     * 若首次满足条件则触发事件通知动态工具注册。
+     */
+    private void checkAndFireCompletion(int totalServices) {
+        if (fullyLoadedServices.size() + failedServices.size() >= totalServices
+            && eventPublished.compareAndSet(false, true)) {
+            this.loaded = true;
+            this.loadingInProgress = false;
+            log.info("所有服务 Schema 加载完毕。成功: {}, 失败: {}",
+                fullyLoadedServices.size(), failedServices.size());
+            loadLatch.countDown();
+            eventPublisher.publishEvent(new SchemaLoadCompleteEvent(this));
+        }
+    }
+
+    /**
+     * 根据服务名从 comet-ports 映射表中查找对应的 Comet 端口。
+     * 规则：AntPath 模式匹配 → 返回第一个匹配项的端口；无匹配 → 返回 null。
+     */
+    private Integer resolveCometPort(String serviceName) {
+        for (Map.Entry<String, Integer> entry : nacosConfig.getCometPorts().entrySet()) {
+            if (entry.getKey() != null && pathMatcher.match(entry.getKey(), serviceName)) {
+                return entry.getValue();
+            }
+        }
+        return null;
+    }
+
     // ========== 公开方法 ==========
 
     /**
@@ -592,7 +683,7 @@ public class CometApiSchemaLoader {
      */
     public String getLoadSummary() {
         long total = serviceRegistry.hasServices()
-            ? serviceRegistry.getServices().stream().filter(s -> s.getComet() != null).count()
+            ? serviceRegistry.getServices().size()
             : 1;
         return String.format("%d/%d (成功: %d, 失败: %d)",
             fullyLoadedServices.size() + failedServices.size(),
@@ -607,7 +698,7 @@ public class CometApiSchemaLoader {
     public void shutdown() {
         asyncExecutor.shutdown();
         try {
-            if (!asyncExecutor.awaitTermination(3, TimeUnit.SECONDS)) {
+            if (!asyncExecutor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 asyncExecutor.shutdownNow();
             }
         } catch (InterruptedException e) {

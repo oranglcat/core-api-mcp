@@ -42,7 +42,7 @@
 - LLM 会盲目试错，先随意选一个 Tool 发出请求，得到错误后再试另一个
 - 大量 Tool 的 description 和 schema 消耗大量 tokens
 
-因此设计为 **"单一统一 Tool"（`invokeBusinessApi`）**，通过 `apiCode` 参数选择接口，配合 `params` 传入业务参数。LLM 只需理解一个 Tool 的用法，通过 description 中的接口列表选择正确的 apiCode。
+因此设计为 **"单一统一 Tool"（`invokeBusinessApi`）**，通过 `apiCode` 参数选择接口，配合 `params` 传入业务参数。LLM 只需理解一个 Tool 的用法，通过 `searchBusinessApi` 搜索找到正确的 apiCode。
 
 ```
 invokeBusinessApi(apiCode, params)
@@ -88,11 +88,7 @@ invokeBusinessApi(apiCode, params)
 
 LLM 的决策流程变为：**不确定时先搜索 → 找到准确 apiCode → 再调用**，大幅降低盲目试错的概率。
 
-同时，`invokeBusinessApi` 的 description 做了三项强化以提升选择准确度：
-
-- **展示 remark（中文业务描述）**：每行接口列出业务说明，帮助 LLM 快速理解接口用途
-- **展示必填入参摘要**：每个接口下方显示字段名和中文描述，帮助 LLM 确认是否匹配当前问题
-- **按 URL 业务路径分组**：从 URL 中提取有业务含义的单词作为组名（如 `loan`、`account`），替代原来无意义的 className 前缀
+`invokeBusinessApi` 的 description 采用**紧凑模式**（固定字符串约 500 字节），不枚举接口列表，引导 LLM 先搜索再调用。工具定义大小 O(1)，不随接口数量增长。
 
 ---
 
@@ -132,14 +128,11 @@ LLM 的决策流程变为：**不确定时先搜索 → 找到准确 apiCode →
 #### 3. Tool 层（tool 包）
 
 - **`DynamicToolRegistrar`**：实现 Spring AI 的 `ToolCallbackProvider` 接口，在 MCP Server 初始化时被调用。核心逻辑：
-  1. 检查 Comet Schema 是否已加载完成
-     - **多服务异步模式**：后台加载未完成 → 返回空工具列表，等待后续事件驱动动态注册
-     - **单服务同步模式**：已加载完成 → 正常构建并返回工具
-  2. 构建 `apiCode → ApiParamSchema` 查找表（apiCode 格式：`{类名}_{方法名}`）
-  3. 注册两个 Tool：
-     - **`invokeBusinessApi`** — 统一业务接口调用。description 按业务模块分组展示接口，每条含 apiCode、中文名、业务描述（remark）和入参摘要；响应末尾追加止语引导，防止 LLM 继续调用其他接口
-     - **`searchBusinessApi`** — 接口搜索。在 apiName、remark、className、methodName、入参名和描述中多字段搜索，评分排序后返回匹配接口详情
-- **`SchemaLoadCompleteListener`**：监听 `SchemaLoadCompleteEvent`，在多服务异步加载完成后将工具动态注册到 `McpSyncServer`，并通知已连接客户端刷新工具列表。从 `DynamicToolRegistrar` 中拆分独立，避免循环依赖
+  1. 使用当前已加载的 Schema（无论是否完成）构建 `apiCode → ApiParamSchema` 查找表
+  2. 注册两个 Tool：
+     - **`invokeBusinessApi`** — 统一业务接口调用。description 采用紧凑模式（不枚举接口列表），引导 LLM 先搜索再调用；响应末尾追加止语引导，防止 LLM 继续调用其他接口；工具内部持有 `codeToSchemaMap`（ConcurrentHashMap）引用，后台加载完成后自动可见新接口
+     - **`searchBusinessApi`** — 接口搜索。在 apiName、remark、className、methodName、入参名和描述中多字段搜索，评分排序后返回匹配接口详情。搜索范围随加载进度自然扩大
+- **`SchemaLoadCompleteListener`**：监听 `SchemaLoadCompleteEvent`，在多服务异步加载完成后刷新 `codeToSchemaMap`（工具已通过 `getToolCallbacks()` 注册，无需重新 `addTool()`），并通知已连接客户端工具列表已变更
 - **`HttpForwarder`**：执行实际 HTTP 转发。处理流程：
   1. 校验必输字段
   2. **动态路由**：通过 `ServiceRouter` 根据 API 路径匹配目标微服务（如 `/pf/**` → Service-PF）
@@ -162,16 +155,16 @@ LLM 的决策流程变为：**不确定时先搜索 → 找到准确 apiCode →
    │  └─ (启动不阻塞，几毫秒返回)
    └─ 单服务模式（兼容）：串行加载，等待完成
 4. Spring AI MCP Server 初始化
-   └─ DynamicToolRegistrar.getToolCallbacks()  [🐛 仅同步模式在此注册]
-      ├─ 多服务异步：返回空，不阻塞启动
-      └─ 单服务同步：构建工具列表并注册
+   └─ DynamicToolRegistrar.getToolCallbacks()  [★ 始终返回工具]
+      ├─ 用当前已加载的 Schema 构建 codeToSchemaMap（可能 partial）
+      ├─ 构建紧凑 ToolDefinition（O(1)，不枚举接口）
+      └─ 返回 [invokeBusinessApi, searchBusinessApi]
+   └─ MCP 客户端连接 → 立即看到两个工具 ✅
 
 5. [多服务异步] 后台加载完毕
    └─ CometApiSchemaLoader 发布 SchemaLoadCompleteEvent
       └─ SchemaLoadCompleteListener 接收事件
-         ├─ 调用 getToolCallbacks() 获取已构建的工具
-         ├─ McpToolUtils.toSyncToolSpecifications() 转换
-         ├─ McpSyncServer.addTool() 动态注册
+         ├─ refreshCodeToSchemaMap() 补齐已注册工具中的数据
          └─ notifyToolsListChanged() 通知客户端刷新
 
 6. MCP Server 启动在 /mcp 端点（SSE 传输）
@@ -225,23 +218,22 @@ Spring AI MCP Server 自动完成握手，无需额外代码。
 
 LLM 通过 `tools/list` 请求获取可用工具。适配器返回两个 Tool：
 
-**① `invokeBusinessApi`** — 业务接口调用工具，description 按业务模块分组展示接口列表，每条包含 apiCode、中文名、业务描述和入参摘要：
+**① `invokeBusinessApi`** — 业务接口调用工具，description 采用紧凑模式（不枚举接口列表），引导 LLM 先搜索再调用：
 
 ```json
 {
   "name": "invokeBusinessApi",
-  "description": "调用后端业务接口（POST）。通过 apiCode 选择要调用的接口... 不确定时先调用 searchBusinessApi 搜索",
+  "description": "调用后端业务接口（POST）。通过 apiCode 选择要调用的接口... 先调用 searchBusinessApi 搜索",
   "inputSchema": {
     "type": "object",
     "properties": {
       "apiCode": {
         "type": "string",
-        "description": "接口编码，格式：{业务类名}_{方法名}",
-        "enum": ["core1200109445_runService", "core1200109456_queryService", ...]
+        "description": "接口编码，格式：{业务类名}_{方法名}。请先调用 searchBusinessApi 搜索获取准确的 apiCode。"
       },
       "params": {
         "type": "object",
-        "description": "接口业务参数（即报文 body 内容）",
+        "description": "接口业务参数（即报文 body 内容），根据选择的 apiCode 不同而不同",
         "additionalProperties": true
       }
     },
@@ -314,7 +306,7 @@ LLM 根据用户的问题，**优先考虑是否需要先搜索**：
 
 #### Step 2.2: DynamicToolRegistrar 接收参数
 
-`DynamicToolRegistrar` 的 `call(String argumentJson)` 方法被 Spring AI MCP 框架调用，接收 JSON 字符串参数：
+`DynamicToolRegistrar` 中的 `ToolCallback.call()` 方法被 Spring AI MCP 框架调用，接收 JSON 字符串参数（内部引用类字段 `codeToSchemaMap`）：
 
 ```java
 public String call(String argumentJson) {
@@ -328,13 +320,13 @@ public String call(String argumentJson) {
     Map<String, Object> params = (Map<String, Object>) args.get("params");
     if (params == null) params = Map.of();
 
-    // 4. 查找 schema（apiCode → URL 映射）
-    ApiParamSchema schema = codeToSchema.get(apiCode);
+    // 4. 查找 schema（apiCode → URL 映射，引用类字段 codeToSchemaMap）
+    ApiParamSchema schema = codeToSchemaMap.get(apiCode);
     if (schema == null && cometLoader.isLoadingInProgress()) {
         // 4a. ★ 后台加载未完成 → 触发按需同步加载
         cometLoader.loadRemainingOnDemand();
         refreshCodeToSchemaMap();   // 增量刷新查找表
-        schema = codeToSchema.get(apiCode);
+        schema = codeToSchemaMap.get(apiCode);
     }
 
     // 5. 从 schema 中提取必输字段列表
@@ -955,8 +947,8 @@ mcp-adapter/
     │   ├── SchemaLoadCompleteEvent.java # ★ 加载完成事件（触发动态工具注册）
     │   └── FieldDef.java             # 字段定义
     └── tool/                         # Tool 层
-        ├── DynamicToolRegistrar.java # MCP Tool 注册器（双 Tool + 按需加载）
-        ├── SchemaLoadCompleteListener.java # ★ 事件监听器（动态注册到 McpSyncServer）
+        ├── DynamicToolRegistrar.java # MCP Tool 注册器（紧凑描述 + 渐进式数据可见）
+        ├── SchemaLoadCompleteListener.java # ★ 事件监听器（刷新 codeToSchemaMap + 通知客户端）
         └── HttpForwarder.java        # HTTP 转发器（动态路由 + 止语引导）
 ```
 
@@ -968,8 +960,8 @@ mcp-adapter/
 |------|------|------|
 | **Tool 数量** | 双 Tool：搜索 + 调用 | 避免 LLM 在多 Tool 间选择困难；搜索工具帮 LLM 快速定位正确 apiCode |
 | **参数来源** | Comet 平台动态加载 | 接口变更无需改代码，实时同步 |
-| **启动 & 注册** | 异步加载 + 事件驱动动态注册 | 多服务 Schema 后台并行加载，完成后发布事件，`SchemaLoadCompleteListener` 通过 `McpSyncServer.addTool()` 动态注册工具并通知客户端刷新，启动不阻塞 |
-| **接口描述** | remark + 入参摘要 + URL 路径分组 | LLM 获得充分信息以区分接口，减少猜错概率 |
+| **启动 & 注册** | 立即注册 + 渐进式数据可见 | `getToolCallbacks()` 始终返回工具（不阻塞），`codeToSchemaMap` 通过引用传递，后台加载完成后自动可见新接口；`SchemaLoadCompleteListener` 刷新 map 并通知客户端 |
+| **接口描述** | 紧凑描述（不枚举接口） | 引导 LLM 使用 `searchBusinessApi` 搜索，工具定义大小 O(1)，不随接口数量增长 |
 | **报文格式** | 可配置模板 + 运行时占位符解析 | 灵活适配金融标准报文结构 |
 | **认证方式** | RestTemplate 拦截器 | 透明支持 basic/bearer 认证 |
 | **错误处理** | 中文友好提示 | LLM 能理解错误并自行修正 |

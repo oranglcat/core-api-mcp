@@ -1,16 +1,13 @@
 package com.mcp.tool;
 
-import com.mcp.config.AppConfig;
-import com.mcp.config.MessageFormatConfig;
-import com.mcp.config.MessageTemplateLoader;
-import com.mcp.config.ServiceInstance;
-import com.mcp.config.ServiceRouter;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.mcp.config.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -58,10 +55,11 @@ public class HttpForwarder {
      * @param apiPath      API 路径（如 /pf/inq/xxx/loan/query）
      * @param params       业务参数（即报文 body 内容）
      * @param requiredFields 必输字段列表（未提供时返回友好提示），可为 null
+     * @param apiCode      接口编码（如 core12000500_run_service），用于推导 messageType/messageCode
      * @return 格式化后的响应文本
      */
     public String forwardPost(String apiPath, Map<String, Object> params,
-                              java.util.List<String> requiredFields) {
+                              List<String> requiredFields, String apiCode) {
         // 必输字段校验
         if (requiredFields != null && !requiredFields.isEmpty()) {
             List<String> missing = new ArrayList<>();
@@ -81,22 +79,28 @@ public class HttpForwarder {
         ServiceInstance service = serviceRouter.route(apiPath);
         String baseUrl = (service != null) ? service.getBaseUrl() : config.originalUrl();
         String url = baseUrl + apiPath;
-        log.info("Unified forward: POST {} (route: {}, params: {})",
-            url, service != null ? service.getId() : "default", params.keySet());
+        log.info("▶ 路由目标: service={}, url={}",
+            service != null ? service.getId() : "default(original)", url);
 
         try {
             // 标准报文封装（如已启用）
             Object requestPayload;
             if (messageFormatConfig.isEnabled()) {
-                requestPayload = buildStandardMessage(apiPath, params);
+                requestPayload = buildStandardMessage(apiPath, params, apiCode);
             } else {
                 requestPayload = params.isEmpty() ? null : params;
             }
 
+            // 打印请求报文（用于排查问题）
+            log.info("▶ 请求报文 [{}]: {}", apiPath, toJsonString(requestPayload));
+
             String response = restTemplate.postForObject(url, requestPayload, String.class);
-            String prettyJson = prettyPrintJson(response);
-            // 成功响应末尾追加止语引导，防止 LLM 继续调用其他接口进行"探索"
-            return prettyJson + "\n\n---\n接口调用成功。以上是完整返回数据，请直接回答用户，**不要继续调用其他接口**。";
+
+            // 打印响应报文（用于排查问题）
+            String prettyResponse = prettyPrintJson(response);
+            log.info("▶ 响应报文 [{}]:\n{}", apiPath, prettyResponse);
+
+            return prettyResponse + "\n\n---\n接口调用成功。以上是完整返回数据，请直接回答用户，**不要继续调用其他接口**。";
         } catch (Exception e) {
             log.error("Unified forward failed: POST {} - {}", url, e.getMessage(), e);
             return "调用接口 " + apiPath + " 失败: " + resolveUserMessage(e);
@@ -135,38 +139,226 @@ public class HttpForwarder {
      * @param apiPath      API 路径，用于匹配 per-API 模板
      * @param businessBody LLM 传入的业务参数
      */
-    private Map<String, Object> buildStandardMessage(String apiPath, Map<String, Object> businessBody) {
+    /** 营业日期缓存（时间过期，线程安全）。runDate 每天只变一次，缓存 5 分钟即可。 */
+    private volatile String cachedRunDate;
+    private volatile long cachedRunDateExpiry;
+
+    /** 缓存有效期（毫秒），默认 5 分钟 */
+    private static final long RUN_DATE_CACHE_TTL = 5 * 60 * 1000;
+
+    /**
+     * 调用 ENSEMBLE-OB-SERVICE 接口查询营业日期（使用标准报文格式）。
+     * <p>
+     * 注意：此处使用标准报文格式包装请求，因为 OB 服务与其他核心服务一样
+     * 要求标准金融报文格式（sysHead + appHead + body），不支持裸 JSON。
+     * <p>
+     * 请求体结构：
+     * <pre>
+     * POST /ob/inq/system/branch/user
+     * {
+     *   "sysHead": { "tranDate":"...", "branchId":"...", "userId":"..." },
+     *   "body":    { "queryInd": "fm_system" }
+     * }
+     * </pre>
+     * 响应中的 runDate 字段通常在 sysHead 中返回。
+     */
+    private String fetchRunDate() {
+        long now = System.currentTimeMillis();
+
+        // 时间过期缓存（线程安全：volatile 保证可见性，runDate 每天一致无需加锁）
+        if (cachedRunDate != null && now < cachedRunDateExpiry) {
+            return cachedRunDate;
+        }
+
+        // 通过路由器获取 OB 服务地址
+        ServiceInstance obService = serviceRouter.route("/ob/inq/system/branch/user");
+        String baseUrl = (obService != null) ? obService.getBaseUrl() : config.originalUrl();
+        String url = baseUrl + "/ob/inq/system/branch/user";
+
+        try {
+            log.info("查询营业日期: POST {} (OB服务路由结果: {})", url,
+                obService != null ? obService.getId() : "null→使用默认URL");
+
+            // ---- 构造标准报文格式请求 ----
+            // 注意：此处我们正在查询 runDate，所以 sysHead 中的 tranDate 使用当前系统日期
+            //（调用 OB 服务拿 runDate 本身就是获取正确的营业日期，sysHead 中的日期是用于
+            //   OB 服务自身处理请求的，不影响返回的 runDate 值）
+            LocalDateTime nowDt = LocalDateTime.now();
+            Map<String, Object> sysHead = new LinkedHashMap<>(messageFormatConfig.getSysHead());
+            sysHead.put("seqNo", generateSeqNo(nowDt));
+            sysHead.put("subSeqNo", generateSubSeqNo(nowDt));
+            sysHead.put("tranDate", nowDt.format(DateTimeFormatter.ofPattern("yyyyMMdd")));
+            sysHead.put("tranTimestamp", nowDt.format(DateTimeFormatter.ofPattern("HHmmssSSS")));
+
+            Map<String, Object> requestBody = new LinkedHashMap<>();
+            requestBody.put("sysHead", sysHead);
+            requestBody.put("body", Map.of("queryInd", "fm_system"));
+
+            String response = restTemplate.postForObject(url, requestBody, String.class);
+            log.debug("营业日期原始响应: {}", response != null ? response.substring(0, Math.min(response.length(), 500)) : "null");
+            if (response != null) {
+                Object root = objectMapper.readValue(response, Object.class);
+                // 在响应中递归查找 runDate 字段（可能在 sysHead/body 嵌套结构中）
+                String runDate = findStringField(root, "runDate");
+                if (runDate != null && !runDate.isEmpty()) {
+                    // 格式统一为 yyyyMMdd
+                    String formatted = runDate.replace("-", "").substring(0, 8);
+                    cachedRunDate = formatted;
+                    cachedRunDateExpiry = now + RUN_DATE_CACHE_TTL;
+                    log.info("查询营业日期成功: {} -> {} (缓存 {} 分钟)", runDate, formatted,
+                        RUN_DATE_CACHE_TTL / 60_000);
+                    return formatted;
+                }
+                log.warn("响应中未找到 runDate 字段。响应结构: {}",
+                    truncateJson(root, 300));
+            }
+        } catch (Exception e) {
+            log.error("查询营业日期失败 (url={}): {}", url, e.getMessage(), e);
+        }
+        String fallback = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        log.warn("回退系统日期: {} (营业日期查询失败)", fallback);
+        // 回退：使用系统日期
+        return fallback;
+    }
+
+    /**
+     * 在嵌套 JSON 对象中递归查找指定字段的值（支持 String / Number / 嵌套结构）。
+     */
+    @SuppressWarnings("unchecked")
+    private String findStringField(Object node, String fieldName) {
+        if (node instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                if (fieldName.equals(entry.getKey())) {
+                    Object val = entry.getValue();
+                    if (val instanceof String) {
+                        return (String) val;
+                    } else if (val instanceof Number) {
+                        // OB 服务可能将 runDate 返回为数值（20240526而非"20240526"）
+                        return String.valueOf(val);
+                    }
+                    // 非 String/Number 类型继续递归（可能在嵌套 Map/List 中）
+                }
+                String found = findStringField(entry.getValue(), fieldName);
+                if (found != null) return found;
+            }
+        } else if (node instanceof List<?> list) {
+            for (Object item : list) {
+                String found = findStringField(item, fieldName);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private Map<String, Object> buildStandardMessage(String apiPath, Map<String, Object> businessBody,
+                                                       String apiCode) {
         // 预计算动态字段—使用同一时间点确保一致性
         LocalDateTime now = LocalDateTime.now();
-        Map<String, String> dynamicFields = new LinkedHashMap<>(messageFormatConfig.getSysHead());
-        dynamicFields.put("seqNo", generateSeqNo(now));
-        dynamicFields.put("subSeqNo", generateSubSeqNo(now));
-        dynamicFields.put("tranDate", now.format(DateTimeFormatter.ofPattern("yyyyMMdd")));
-        dynamicFields.put("tranTimestamp", now.format(DateTimeFormatter.ofPattern("HHmmssSSS")));
-        dynamicFields.put("serverId", "127.0.0.1");
-        // 补充模板中可能出现的公共占位符
-        dynamicFields.putIfAbsent("serviceCode", "");
-        dynamicFields.putIfAbsent("messageType", "");
-        dynamicFields.putIfAbsent("messageCode", "");
+        String runDate = fetchRunDate();
 
-        // 1. 优先使用 per-API 模板
+        // ---- 占位符池 ----
+        // 1a. 从配置加载的系统头默认值（仅用作模板 ${...} 占位符解析）
+        Map<String, String> resolvedFields = new LinkedHashMap<>(messageFormatConfig.getSysHead());
+        // 1b. 动态生成字段（seqNo / subSeqNo / tranTimestamp ...）
+        resolvedFields.put("seqNo", generateSeqNo(now));
+        resolvedFields.put("subSeqNo", generateSubSeqNo(now));
+        resolvedFields.put("tranDate", runDate);
+        resolvedFields.put("tranTimestamp", now.format(DateTimeFormatter.ofPattern("HHmmssSSS")));
+        resolvedFields.put("serverId", "127.0.0.1");
+        // 补充模板中可能出现的公共占位符
+        resolvedFields.putIfAbsent("serviceCode", "");
+        resolvedFields.putIfAbsent("messageType", "");
+        resolvedFields.putIfAbsent("messageCode", "");
+
+        // 1c. 从 core 类接口的 apiCode 中动态推导 messageType / messageCode
+        if (apiCode != null) {
+            String[] extracted = extractMessageTypeAndCode(apiCode);
+            if (extracted[0] != null) {
+                resolvedFields.put("messageType", extracted[0]);
+                resolvedFields.put("messageCode", extracted[1]);
+            }
+        }
+
+        // ---- 优先使用 per-API 模板 ----
         Map<String, Object> template = messageTemplateLoader.getTemplate(apiPath);
         if (template != null) {
-            Map<String, Object> message = deepResolvePlaceholders(template, dynamicFields);
+            Map<String, Object> message = deepResolvePlaceholders(template, resolvedFields);
+            // 确保 tranDate 在 sysHead 中（模板中存在 ${tranDate} 时自动解析，
+            // 此处作为兜底保证即使模板未定义 ${tranDate} 也能正确设置）
+            ensureFieldInSysHead(message, "tranDate", runDate);
             message.put("body", businessBody.isEmpty() ? new LinkedHashMap<>() : businessBody);
             log.debug("Using per-API template for: {}", apiPath);
             return message;
         }
 
-        // 2. 兜底：全局配置模板
+        // ---- 兜底：全局配置模板 ----
         log.debug("No per-API template for: {}, using global config fallback", apiPath);
         Map<String, Object> message = new LinkedHashMap<>();
         Map<String, String> sysHead = new LinkedHashMap<>(messageFormatConfig.getSysHead());
-        sysHead.putAll(dynamicFields);   // 动态字段覆盖配置中的同名占位
+        // 显式设置每个动态字段到 sysHead（不通过 putAll(dynamicFields) 混入）
+        sysHead.put("tranDate", runDate);
+        sysHead.put("seqNo", generateSeqNo(now));
+        sysHead.put("subSeqNo", generateSubSeqNo(now));
+        sysHead.put("tranTimestamp", now.format(DateTimeFormatter.ofPattern("HHmmssSSS")));
+        sysHead.put("serverId", "127.0.0.1");
         message.put("sysHead", sysHead);
         message.put("appHead", new LinkedHashMap<>(messageFormatConfig.getAppHead()));
         message.put("body", businessBody.isEmpty() ? new LinkedHashMap<>() : businessBody);
         return message;
+    }
+
+    /**
+     * 从 core 类接口的 apiCode 中提取 messageType 和 messageCode。
+     * <p>
+     * core 类接口的 apiCode 格式为 {@code core + 8位数字 + _ + 方法名}，
+     * 其中 8 位数字按银行业务规范定义：前 4 位为 messageType，后 4 位为 messageCode。
+     * <p>
+     * 示例：
+     * <pre>
+     *   "core12000500_run_service" → messageType = "1200", messageCode = "0500"
+     *   "core12001094_runService"  → messageType = "1200", messageCode = "1094"
+     * </pre>
+     * <p>
+     * 非 core 类接口（apiCode 不以 "core" 开头或不含 8 位数字）返回 {@code {null, null}}，
+     * 调用方应忽略该结果，保持原有默认值。
+     *
+     * @param apiCode 接口编码
+     * @return 长度为 2 的数组：[messageType, messageCode]，匹配失败时两个元素均为 null
+     */
+    private String[] extractMessageTypeAndCode(String apiCode) {
+        if (apiCode == null || apiCode.isEmpty()) {
+            return new String[]{null, null};
+        }
+        // 匹配 "core" 后紧跟的 8 位数字
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
+            "core(\\d{4})(\\d{4})", java.util.regex.Pattern.CASE_INSENSITIVE);
+        java.util.regex.Matcher matcher = pattern.matcher(apiCode);
+        if (matcher.find()) {
+            return new String[]{matcher.group(1), matcher.group(2)};
+        }
+        return new String[]{null, null};
+    }
+
+    /**
+     * 确保指定字段在消息的 sysHead 中存在且已解析。
+     * <p>
+     * 覆盖策略：
+     * <ol>
+     *   <li>字段不存在 → 补入</li>
+     *   <li>字段值为 null → 补入</li>
+     *   <li>字段值仍为未解析的占位符（如 {@code "${tranDate}"}）→ 覆盖为真实值</li>
+     * </ol>
+     */
+    @SuppressWarnings("unchecked")
+    private void ensureFieldInSysHead(Map<String, Object> message, String fieldName, String value) {
+        if (message.containsKey("sysHead") && message.get("sysHead") instanceof Map) {
+            Map<String, Object> sysHead = (Map<String, Object>) message.get("sysHead");
+            Object existing = sysHead.get(fieldName);
+            if (existing == null
+                || (existing instanceof String && ((String) existing).contains("${"))) {
+                sysHead.put(fieldName, value);
+            }
+        }
     }
 
     /**
@@ -221,6 +413,16 @@ public class HttpForwarder {
 
     // ========== 工具方法 ==========
 
+    /** 将对象序列化为 JSON 字符串（用于日志输出） */
+    private String toJsonString(Object obj) {
+        if (obj == null) return "null";
+        try {
+            return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(obj);
+        } catch (Exception e) {
+            return obj.toString();
+        }
+    }
+
     /** 美化 JSON 输出 */
     private String prettyPrintJson(String raw) {
         try {
@@ -228,6 +430,19 @@ public class HttpForwarder {
             return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(json);
         } catch (Exception e) {
             return raw;  // 不是 JSON 就原样返回
+        }
+    }
+
+    /**
+     * 将 JSON 对象截断为指定长度的纯文本摘要（用于日志输出，避免打爆日志）。
+     */
+    private String truncateJson(Object obj, int maxLen) {
+        try {
+            String json = objectMapper.writeValueAsString(obj);
+            if (json.length() <= maxLen) return json;
+            return json.substring(0, maxLen) + "... (truncated " + json.length() + " chars)";
+        } catch (Exception e) {
+            return String.valueOf(obj);
         }
     }
 }

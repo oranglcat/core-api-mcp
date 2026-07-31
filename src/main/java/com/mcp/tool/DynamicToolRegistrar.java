@@ -1,9 +1,9 @@
 package com.mcp.tool;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mcp.scanner.ApiParamSchema;
 import com.mcp.scanner.CometApiSchemaLoader;
 import com.mcp.scanner.FieldDef;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.model.ToolContext;
@@ -11,7 +11,10 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.definition.ToolDefinition;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
+import org.springframework.util.AntPathMatcher;
+import org.springframework.util.PathMatcher;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -41,6 +44,36 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
     /** 参数 Schema 加载器：从 Comet 平台获取接口列表 */
     private final CometApiSchemaLoader cometLoader;
 
+    /** 接口路径白名单过滤器 */
+    private final PathMatcher pathMatcher = new AntPathMatcher();
+    private final Environment environment;
+
+    /**
+     * 读取并解析白名单路径配置（逗号分隔字符串 → Java List）。
+     * 配置格式示例：/rb/nfin/interest/**,/ob/inq/system/branch/user
+     */
+    private List<String> getIncludePaths() {
+        String raw = environment.getProperty("service.interface.filter.include-paths", "");
+        if (raw.isBlank() || "".equals(raw)) {
+            return List.of();
+        }
+        return Arrays.stream(raw.split(","))
+            .map(String::trim)
+            .filter(s -> !s.isEmpty())
+            .toList();
+    }
+
+    /**
+     * 判断接口路径是否通过过滤。无白名单配置时默认放行所有接口。
+     */
+    private boolean isPathAllowed(String path) {
+        List<String> includePaths = getIncludePaths();
+        if (!includePaths.isEmpty()) {
+            return includePaths.stream().anyMatch(p -> pathMatcher.match(p, path));
+        }
+        return true; // 未配置白名单时全部放行
+    }
+
     /**
      * apiCode → ApiParamSchema 动态查找表。
      * <p>
@@ -50,10 +83,12 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
 
     public DynamicToolRegistrar(HttpForwarder httpForwarder,
                                 @Autowired(required = false) CometApiSchemaLoader cometLoader,
-                                ObjectMapper objectMapper) {
+                                ObjectMapper objectMapper,
+                                Environment environment) {
         this.httpForwarder = httpForwarder;
         this.cometLoader = cometLoader;
         this.objectMapper = objectMapper;
+        this.environment = environment;
     }
 
     /** 搜索工具名称 */
@@ -113,7 +148,13 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
      */
     private Map<String, ApiParamSchema> buildCodeToSchemaMap(Map<String, ApiParamSchema> schemas) {
         Map<String, ApiParamSchema> map = new LinkedHashMap<>();
+        int skipped = 0;
         for (ApiParamSchema s : schemas.values()) {
+            // 接口路径白名单过滤
+            if (!isPathAllowed(s.url())) {
+                skipped++;
+                continue;
+            }
             String code = buildApiCode(s);
             if (code != null) {
                 map.put(code, s);
@@ -121,6 +162,9 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
                 log.warn("Skipping schema with empty className/methodName: url={}, apiName={}",
                     s.url(), s.apiName());
             }
+        }
+        if (skipped > 0) {
+            log.info("接口白名单过滤: 放行 {} 个, 过滤 {} 个", map.size(), skipped);
         }
         return map;
     }
@@ -210,8 +254,8 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
                         .map(f -> f.name())
                         .toList();
 
-                    // 转发 POST 请求（含必输校验）
-                    return httpForwarder.forwardPost(schema.url(), params, requiredFields);
+                    // 转发 POST 请求（含必输校验），传入 apiCode 用于推导 messageType/messageCode
+                    return httpForwarder.forwardPost(schema.url(), params, requiredFields, apiCode);
 
                 } catch (Exception e) {
                     log.error("Unified tool call failed: {}", e.getMessage(), e);
@@ -277,16 +321,28 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
 
     /**
      * 执行多字段关键词搜索，返回格式化的匹配结果。
+     * <p>
+     * 搜索范围为全量已加载接口（含非白名单），白名单外的结果标注为不可调用。
+     * 白名单接口加权优先展示。
      */
     private String searchApis(String keywords) {
         String[] parts = keywords.toLowerCase().split("\\s+");
 
-        // 评分: 每个匹配 +1 分
+        // 搜索范围：全量已加载 Schema（不含白名单过滤），确保非白名单接口也能被搜索到
+        Map<String, ApiParamSchema> allSchemas = (cometLoader != null)
+            ? cometLoader.getAllSchemas()
+            : Map.of();
+
         List<ScoredResult> scored = new ArrayList<>();
 
-        for (Map.Entry<String, ApiParamSchema> entry : codeToSchemaMap.entrySet()) {
-            String apiCode = entry.getKey();
+        for (Map.Entry<String, ApiParamSchema> entry : allSchemas.entrySet()) {
             ApiParamSchema s = entry.getValue();
+            String apiCode = buildApiCode(s);
+            if (apiCode == null) continue;
+
+            // 判断是否在白名单内（codeToSchemaMap 只包含白名单接口）
+            boolean whitelisted = codeToSchemaMap.containsKey(apiCode);
+
             int score = 0;
 
             // 在多个字段中搜索
@@ -313,7 +369,9 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
             }
 
             if (score > 0) {
-                scored.add(new ScoredResult(apiCode, s, score));
+                // 白名单接口加权，确保优先展示
+                if (whitelisted) score += 100;
+                scored.add(new ScoredResult(apiCode, s, score, whitelisted));
             }
         }
 
@@ -325,17 +383,34 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
             return "未找到匹配 \"" + keywords + "\" 的接口。请尝试其他关键词。";
         }
 
+        long whitelistedCount = scored.stream().filter(r -> r.whitelisted).count();
+
         StringBuilder sb = new StringBuilder();
         sb.append("找到 ").append(scored.size()).append(" 个匹配接口");
+        sb.append("（其中 ").append(whitelistedCount).append(" 个可调用");
+        long nonWhitelisted = scored.size() - whitelistedCount;
+        if (nonWhitelisted > 0) {
+            sb.append("，").append(nonWhitelisted).append(" 个未在白名单需添加配置");
+        }
+        sb.append("）");
         if (scored.size() > limit) sb.append("，显示前 ").append(limit).append(" 个");
         sb.append(":\n\n");
 
         for (int i = 0; i < limit; i++) {
             ScoredResult r = scored.get(i);
             ApiParamSchema s = r.schema;
-            sb.append(i + 1).append(". ").append(r.apiCode);
+            sb.append(i + 1).append(". ");
+            if (r.whitelisted) {
+                sb.append("✅ ");
+            } else {
+                sb.append("⚠️ ");
+            }
+            sb.append(r.apiCode);
             if (s.apiName() != null && !s.apiName().isBlank()) {
                 sb.append(" (").append(s.apiName()).append(")");
+            }
+            if (!r.whitelisted) {
+                sb.append(" 【不可调用：未在白名单】");
             }
             sb.append("\n");
             if (s.remark() != null && !s.remark().isBlank()) {
@@ -374,7 +449,7 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
             sb.append("\n");
         }
 
-        sb.append("确定 apiCode 后，请调用 invokeBusinessApi 工具执行实际接口调用。");
+        sb.append("确定可调用的 apiCode 后（仅 ✅ 标记的接口），请调用 invokeBusinessApi 工具执行实际接口调用。");
         return sb.toString();
     }
 
@@ -383,10 +458,12 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
         final String apiCode;
         final ApiParamSchema schema;
         final int score;
-        ScoredResult(String apiCode, ApiParamSchema schema, int score) {
+        final boolean whitelisted;
+        ScoredResult(String apiCode, ApiParamSchema schema, int score, boolean whitelisted) {
             this.apiCode = apiCode;
             this.schema = schema;
             this.score = score;
+            this.whitelisted = whitelisted;
         }
     }
 

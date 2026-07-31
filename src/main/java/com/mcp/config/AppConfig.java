@@ -1,12 +1,17 @@
 package com.mcp.config;
 
+
+
+import org.apache.hc.client5.http.config.RequestConfig;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.core5.util.Timeout;
 import org.springframework.boot.context.properties.ConfigurationProperties;
-import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
 import org.springframework.web.client.RestTemplate;
-
-import java.time.Duration;
 
 /**
  * 应用配置 — 绑定 application.yml 中 service.original.* 的配置项。
@@ -58,11 +63,26 @@ public class AppConfig {
     }
 
     @Bean
-    public RestTemplate restTemplate(RestTemplateBuilder builder) {
-        RestTemplate rt = builder
-            .connectTimeout(Duration.ofMillis(connectTimeout))
-            .readTimeout(Duration.ofMillis(readTimeout))
+    public RestTemplate restTemplate() {
+        // 连接池：总上限 100，单路由上限 20，避免高并发时端口耗尽
+        PoolingHttpClientConnectionManager cm = new PoolingHttpClientConnectionManager();
+        cm.setMaxTotal(100);
+        cm.setDefaultMaxPerRoute(20);
+
+        RequestConfig requestConfig = RequestConfig.custom()
+            .setConnectTimeout(Timeout.ofMilliseconds(connectTimeout))
+            .setResponseTimeout(Timeout.ofMilliseconds(readTimeout))
             .build();
+
+        CloseableHttpClient httpClient = HttpClientBuilder.create()
+            .setConnectionManager(cm)
+            .setDefaultRequestConfig(requestConfig)
+            .build();
+
+        HttpComponentsClientHttpRequestFactory factory =
+            new HttpComponentsClientHttpRequestFactory(httpClient);
+        RestTemplate rt = new RestTemplate(factory);
+
         if (auth.isEnabled()) {
             rt.getInterceptors().add((request, body, execution) -> {
                 if ("bearer".equalsIgnoreCase(auth.getType()) && auth.getToken() != null) {

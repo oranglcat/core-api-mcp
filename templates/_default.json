@@ -1,23 +1,28 @@
 {
-  "sysHead" : {
-    "seqNo" : "${seqNo}",
-    "subSeqNo" : "${subSeqNo}",
-    "tranDate" : "${tranDate}",
-    "tranTimestamp" : "${tranTimestamp}",
-    "branchId" : "${branchId}",
-    "userId" : "${userId}",
-    "userLang" : "CHINESE",
-    "moduleId" : "CL",
-    "sceneId" : "01",
-    "serverId" : "127.0.0.1",
-    "sourceType" : "MT",
-    "authFlag" : "N"
+  "sysHead": {
+    "seqNo": "${seqNo}",
+    "subSeqNo": "${subSeqNo}",
+    "tranDate": "${tranDate}",
+    "tranTimestamp": "${tranTimestamp}",
+    "branchId": "351001",
+    "destBranchNo": "351001",
+    "sourceBranchNo": "351001",
+    "sourceType": "MT",
+    "messageCode": "${messageCode}",
+    "messageType": "${messageType}",
+    "serviceCode": "MbsdCore",
+    "sceneId": "01",
+    "userId": "CS003",
+    "userLang": "CHINESE",
+    "authFlag": "N",
+    "tranMode": "ONLINE"
   },
-  "appHead" : {
-    "currentNum" : "0",
-    "pageEnd" : "0",
-    "pageStart" : "0",
-    "pgupOrPgdn" : "0",
-    "totalNum" : "-1"
+  "appHead": {
+    "currentNum": "0",
+    "pageEnd": "0",
+    "pageStart": "0",
+    "pgupOrPgdn": "0",
+    "totalFlag": "E",
+    "totalNum": "-1"
   }
 }

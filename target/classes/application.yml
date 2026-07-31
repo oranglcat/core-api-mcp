@@ -38,7 +38,7 @@ service:
   # 每个接口可单独在 template-dir 下创建 *.json 模板，按 URL 路径匹配
   message-format:
     enabled: true
-    template-dir: ./templates               # 存放各接口报文模板的目录
+    template-dir: templates               # 存放各接口报文模板的目录
     # 以下 sys-head / app-head 为兜底配置（当 per-API 模板不存在时使用）
     sys-head:
       branchId: "351002"
@@ -58,17 +58,9 @@ service:
   # Nacos 服务发现
   nacos:
     enabled: true
-    server-addr: http://192.168.161.214:8848/nacos
-    namespace: online-batch_uat
-    group: online-batch-uat
-
-    # Comet 平台（所有服务共用同一个 Comet 主机，端口按服务名映射）
-    comet-host: 10.127.7.140
-
-    # Comet 端口映射表（按服务名 Ant 模式匹配，未匹配使用 default-comet-port）
-    comet-ports:
-      "ENSEMBLE-RB-*": 9040
-      "ENSEMBLE-OB-*": 9020
+    server-addr: http://10.7.30.30:8848/nacos
+    namespace: online-batch_dev
+    group: online-batch-dev
 
     # 服务过滤
     filter:
@@ -81,9 +73,11 @@ service:
     # 定时刷新（秒，0=不刷新）
     refresh-interval: 300
 
-  # Comet 平台配置（单服务模式 / 默认兜底）
-  # 当 Nacos 未启用或无可用服务时使用此地址
-  comet:
-    enabled: true
-    base-url: http://10.127.7.141:9020  # ← Comet 平台地址
-    timeout: 5000
+  # Comet API 集成在微服务自身主机端口上，无需独立配置
+
+  # 接口白名单过滤 — 只注册匹配的接口为 MCP 工具，减少无关接口干扰 LLM 选择
+  # 格式：逗号分隔的 Ant 路径模式，如 "/rb/nfin/interest/**,/ob/inq/system/branch/user"
+  interface:
+    filter:
+      include-paths: /rb/nfin/interest/**,/ob/inq/system/branch/user
+      exclude-paths: ""

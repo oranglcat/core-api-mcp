@@ -41,8 +41,8 @@ service:
     template-dir: templates               # 存放各接口报文模板的目录
     # 以下 sys-head / app-head 为兜底配置（当 per-API 模板不存在时使用）
     sys-head:
-      branchId: "351002"
-      userId: QQ
+      branchId: "351001"
+      userId: CS003
       userLang: CHINESE
       moduleId: CL
       sceneId: "01"
@@ -68,6 +68,8 @@ service:
       include-patterns:
         - ENSEMBLE-RB-*
         - ENSEMBLE-OB-*
+        - ENSEMBLE-CIF-*
+        - ENSEMBLE-CL-*
       exclude-patterns: [ ]
 
     # 定时刷新（秒，0=不刷新）

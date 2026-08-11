@@ -7,6 +7,7 @@ import com.alibaba.nacos.api.naming.NamingService;
 import com.alibaba.nacos.api.naming.pojo.Instance;
 import com.alibaba.nacos.api.naming.pojo.ListView;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -41,6 +42,15 @@ public class NacosServiceDiscoverer {
         return t;
     });
 
+    /**
+     * 复用的 NamingService 实例（首次刷新时创建，后续刷新复用）。
+     * <p>
+     * 早期实现每次刷新都新建一个 Nacos NamingService 且从不关闭——每个实例会
+     * 拉起多条 gRPC/调度后台线程，长时间运行线程数无限累积，最终拖垮 CPU 与内存。
+     * 这里改为单例复用 + 应用退出时 {@link #shutdown()} 关闭。
+     */
+    private volatile NamingService naming;
+
     public NacosServiceDiscoverer(NacosConfig nacosConfig, ServiceRegistry serviceRegistry) {
         this.nacosConfig = nacosConfig;
         this.serviceRegistry = serviceRegistry;
@@ -56,10 +66,10 @@ public class NacosServiceDiscoverer {
         log.info("Nacos 服务发现已启用，正在从 Nacos 加载服务列表...");
         refreshServices();
 
-        // 定时刷新
+        // 定时刷新（固定延迟：上一次执行结束后再等待 interval，避免慢刷新堆积）
         int interval = nacosConfig.getRefreshInterval();
         if (interval > 0) {
-            scheduler.scheduleAtFixedRate(this::refreshServices,
+            scheduler.scheduleWithFixedDelay(this::refreshServices,
                     interval, interval, TimeUnit.SECONDS);
             log.info("Nacos 服务列表定时刷新已启动，间隔 {} 秒", interval);
         }
@@ -70,11 +80,7 @@ public class NacosServiceDiscoverer {
      */
     public void refreshServices() {
         try {
-            Properties props = new Properties();
-            props.put(PropertyKeyConst.SERVER_ADDR, nacosConfig.getServerAddr());
-            props.put(PropertyKeyConst.NAMESPACE, nacosConfig.getNamespace());
-
-            NamingService naming = NamingFactory.createNamingService(props);
+            NamingService naming = getOrCreateNamingService();
 
             // 1. 获取全量服务列表
             ListView<String> services = naming.getServicesOfServer(1, Integer.MAX_VALUE, nacosConfig.getGroup());
@@ -104,6 +110,45 @@ public class NacosServiceDiscoverer {
             log.error("Nacos 服务发现刷新失败: {}", e.getErrMsg(), e);
         } catch (Exception e) {
             log.error("Nacos 服务发现刷新出现未知异常", e);
+        }
+    }
+
+    /**
+     * 获取（或首次创建）复用的 NamingService。
+     * <p>
+     * 双重检查锁保证线程安全且只创建一次。若创建失败（Nacos 暂不可达），
+     * 保持 null 以便下次刷新时重试，避免一次失败导致后续永远无法恢复。
+     */
+    private NamingService getOrCreateNamingService() throws NacosException {
+        NamingService local = this.naming;
+        if (local == null) {
+            synchronized (this) {
+                local = this.naming;
+                if (local == null) {
+                    Properties props = new Properties();
+                    props.put(PropertyKeyConst.SERVER_ADDR, nacosConfig.getServerAddr());
+                    props.put(PropertyKeyConst.NAMESPACE, nacosConfig.getNamespace());
+                    local = NamingFactory.createNamingService(props);
+                    this.naming = local;
+                }
+            }
+        }
+        return local;
+    }
+
+    /**
+     * 应用退出时释放 Nacos 客户端与调度线程，避免线程泄漏。
+     */
+    @PreDestroy
+    public void shutdown() {
+        scheduler.shutdownNow();
+        NamingService local = this.naming;
+        if (local != null) {
+            try {
+                local.shutDown();
+            } catch (NacosException e) {
+                log.warn("关闭 Nacos NamingService 失败: {}", e.getErrMsg());
+            }
         }
     }
 

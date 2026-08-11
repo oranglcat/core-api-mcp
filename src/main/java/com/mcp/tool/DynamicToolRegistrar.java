@@ -248,14 +248,8 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
                         ? (Map<String, Object>) args.get("params")
                         : Map.of();
 
-                    // 从 Schema 中提取必输字段
-                    List<String> requiredFields = schema.inputs().stream()
-                        .filter(f -> f.required())
-                        .map(f -> f.name())
-                        .toList();
-
-                    // 转发 POST 请求（含必输校验），传入 apiCode 用于推导 messageType/messageCode
-                    return httpForwarder.forwardPost(schema.url(), params, requiredFields, apiCode);
+                    // 转发 POST 请求（含必输/取值范围校验），传入完整字段定义，apiCode 用于推导 messageType/messageCode
+                    return httpForwarder.forwardPost(schema.url(), params, schema.inputs(), apiCode);
 
                 } catch (Exception e) {
                     log.error("Unified tool call failed: {}", e.getMessage(), e);
@@ -418,7 +412,7 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
             }
             sb.append("   路径: ").append(s.url()).append("\n");
 
-            // 必填参数
+            // 参数（全量展示，含类型、描述、取值范围）
             List<FieldDef> required = s.inputs().stream()
                 .filter(FieldDef::required).toList();
             List<FieldDef> optional = s.inputs().stream()
@@ -427,29 +421,40 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
             if (!required.isEmpty()) {
                 sb.append("   必填参数: ");
                 sb.append(String.join(", ", required.stream()
-                    .map(f -> {
-                        String desc = f.description() != null && !f.description().isBlank()
-                            ? "(" + f.description() + ")" : "";
-                        return f.name() + desc;
-                    }).toList()));
+                    .map(this::formatParamField)
+                    .toList()));
                 sb.append("\n");
             }
             if (!optional.isEmpty()) {
                 sb.append("   可选参数: ");
                 sb.append(String.join(", ", optional.stream()
-                    .limit(5)
-                    .map(f -> {
-                        String desc = f.description() != null && !f.description().isBlank()
-                            ? "(" + f.description() + ")" : "";
-                        return f.name() + desc;
-                    }).toList()));
-                if (optional.size() > 5) sb.append(" ...");
+                    .map(this::formatParamField)
+                    .toList()));
                 sb.append("\n");
             }
             sb.append("\n");
         }
 
         sb.append("确定可调用的 apiCode 后（仅 ✅ 标记的接口），请调用 invokeBusinessApi 工具执行实际接口调用。");
+        return sb.toString();
+    }
+
+    /**
+     * 格式化单个参数的展示文本：name(type) 描述 [取值范围: values]
+     * <p>
+     * 例：ccy(String(3)) 币种 [取值范围: D,I]
+     */
+    private String formatParamField(FieldDef f) {
+        StringBuilder sb = new StringBuilder(f.name());
+        if (f.type() != null && !f.type().isBlank()) {
+            sb.append("(").append(f.type()).append(")");
+        }
+        if (f.description() != null && !f.description().isBlank()) {
+            sb.append(" ").append(f.description());
+        }
+        if (f.validValues() != null && !f.validValues().isBlank()) {
+            sb.append(" [取值范围: ").append(f.validValues()).append("]");
+        }
         return sb.toString();
     }
 

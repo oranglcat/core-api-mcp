@@ -2,6 +2,7 @@ package com.mcp.tool;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mcp.config.*;
+import com.mcp.scanner.FieldDef;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -11,9 +12,13 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * HTTP 转发器 — 将 MCP Tool 调用转发为 HTTP 请求到原 Spring Boot 服务。
@@ -52,16 +57,19 @@ public class HttpForwarder {
      * 由 {@link DynamicToolRegistrar} 调用，根据 Comet Schema 中的 API 路径
      * 拼接完整 URL，封装标准报文后发送 POST 请求到后端服务。
      *
-     * @param apiPath      API 路径（如 /pf/inq/xxx/loan/query）
-     * @param params       业务参数（即报文 body 内容）
-     * @param requiredFields 必输字段列表（未提供时返回友好提示），可为 null
-     * @param apiCode      接口编码（如 core12000500_run_service），用于推导 messageType/messageCode
+     * @param apiPath     API 路径（如 /pf/inq/xxx/loan/query）
+     * @param params      业务参数（即报文 body 内容）
+     * @param inputFields 接口入参字段定义列表（含必输标记与取值范围），可为 null
+     * @param apiCode     接口编码（如 core12000500_run_service），用于推导 messageType/messageCode
      * @return 格式化后的响应文本
      */
     public String forwardPost(String apiPath, Map<String, Object> params,
-                              List<String> requiredFields, String apiCode) {
-        // 必输字段校验
-        if (requiredFields != null && !requiredFields.isEmpty()) {
+                              List<FieldDef> inputFields, String apiCode) {
+        // 必输字段校验（从字段定义推导必输字段名）
+        List<String> requiredFields = inputFields != null
+            ? inputFields.stream().filter(FieldDef::required).map(FieldDef::name).toList()
+            : List.of();
+        if (!requiredFields.isEmpty()) {
             List<String> missing = new ArrayList<>();
             for (String field : requiredFields) {
                 if (params == null || !params.containsKey(field) || params.get(field) == null) {
@@ -71,6 +79,12 @@ public class HttpForwarder {
             if (!missing.isEmpty()) {
                 return "错误: 缺少必输参数 [" + String.join(", ", missing) + "]。请提供这些参数后重试。";
             }
+        }
+
+        // 取值范围校验（仅顶层字段）
+        if (inputFields != null && params != null) {
+            String rangeError = validateValueRanges(params, inputFields);
+            if (rangeError != null) return rangeError;
         }
 
         if (params == null) params = Map.of();
@@ -91,14 +105,20 @@ public class HttpForwarder {
                 requestPayload = params.isEmpty() ? null : params;
             }
 
-            // 打印请求报文（用于排查问题）
-            log.info("▶ 请求报文 [{}]: {}", apiPath, toJsonString(requestPayload));
+            // 完整请求报文仅 debug 输出——toJsonString 只为日志服务，在 debug 关闭时不再序列化，
+            // 避免每次调用都全量序列化并写入日志（CPU + 磁盘开销）
+            if (log.isDebugEnabled()) {
+                log.debug("▶ 请求报文 [{}]: {}", apiPath, toJsonString(requestPayload));
+            }
 
             String response = restTemplate.postForObject(url, requestPayload, String.class);
 
-            // 打印响应报文（用于排查问题）
+            // 响应报文需 pretty 格式化后返回给 LLM（序列化成本无法省），但完整报文仅 debug 时写日志
             String prettyResponse = prettyPrintJson(response);
-            log.info("▶ 响应报文 [{}]:\n{}", apiPath, prettyResponse);
+            if (log.isDebugEnabled()) {
+                log.debug("▶ 响应报文 [{}]:\n{}", apiPath, prettyResponse);
+            }
+            log.info("▶ 调用完成 [{}]: 响应 {} 字符", apiPath, prettyResponse.length());
 
             return prettyResponse + "\n\n---\n接口调用成功。以上是完整返回数据，请直接回答用户，**不要继续调用其他接口**。";
         } catch (Exception e) {
@@ -122,6 +142,60 @@ public class HttpForwarder {
         if (msg.contains("404")) return "请求的接口不存在，请联系管理员。";
         if (msg.contains("500")) return "服务端内部错误，已记录日志，请稍后重试。";
         return "请求处理失败: " + msg;
+    }
+
+    // ========== 取值范围校验 ==========
+
+    /**
+     * 校验参数值是否在字段允许的取值范围内（仅顶层字段）。
+     * <p>
+     * 取值范围格式为逗号分隔枚举（如 "D,I"、"01,02"）。
+     * 标量值直接匹配；List 值逐元素匹配；Map 值跳过（嵌套对象不属于顶层字段校验范围）。
+     *
+     * @param params      业务参数
+     * @param inputFields 入参字段定义列表
+     * @return 校验失败的错误提示，全部通过时返回 null
+     */
+    private String validateValueRanges(Map<String, Object> params, List<FieldDef> inputFields) {
+        for (FieldDef field : inputFields) {
+            String valid = field.validValues();
+            if (valid == null || valid.isBlank()) continue;
+            if (!params.containsKey(field.name()) || params.get(field.name()) == null) continue;
+
+            Set<String> allowed = parseValidValues(valid);
+            if (allowed.isEmpty()) continue;
+
+            Object value = params.get(field.name());
+            if (value instanceof List<?> list) {
+                for (Object item : list) {
+                    if (item == null) continue;
+                    if (!allowed.contains(String.valueOf(item).trim())) {
+                        return buildRangeError(field, valid, allowed, String.valueOf(item));
+                    }
+                }
+            } else if (!(value instanceof Map)) {
+                String s = String.valueOf(value).trim();
+                if (!allowed.contains(s)) {
+                    return buildRangeError(field, valid, allowed, s);
+                }
+            }
+            // Map 值跳过（嵌套对象不属于顶层字段校验范围）
+        }
+        return null;
+    }
+
+    /** 构造取值范围校验失败的错误提示 */
+    private String buildRangeError(FieldDef field, String valid, Set<String> allowed, String actualValue) {
+        return "错误: 参数 [" + field.name() + "] 的值 '" + actualValue
+            + "' 不在允许范围 [" + valid + "] 内，请使用: " + String.join(", ", allowed) + "。";
+    }
+
+    /** 解析逗号分隔的取值范围（支持半角/全角逗号），按原顺序去重返回 */
+    private Set<String> parseValidValues(String valid) {
+        return Arrays.stream(valid.split("[,，]"))
+            .map(String::trim)
+            .filter(s -> !s.isEmpty())
+            .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
     // ========== 标准报文格式封装 ==========

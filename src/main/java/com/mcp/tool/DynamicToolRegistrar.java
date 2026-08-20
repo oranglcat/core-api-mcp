@@ -94,6 +94,9 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
     /** 搜索工具名称 */
     private static final String SEARCH_TOOL_NAME = "searchBusinessApi";
 
+    /** 接口详情工具名称 */
+    private static final String DETAIL_TOOL_NAME = "getApiDetail";
+
     @Override
     public ToolCallback[] getToolCallbacks() {
         if (cometLoader == null) {
@@ -104,15 +107,15 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
         // 使用当前已加载的 Schema 构建查找表（可能是 partial，异步加载中也会返回非空工具）
         rebuildCodeToSchemaMap(cometLoader.getAllSchemas());
 
-        log.info("构建 MCP 工具: {} (已加载 {} 个接口, 加载状态: {}), {}",
-            UNIFIED_TOOL_NAME, codeToSchemaMap.size(),
+        log.info("构建 MCP 工具: {}, {}, {} (已加载 {} 个接口, 加载状态: {})",
+            UNIFIED_TOOL_NAME, SEARCH_TOOL_NAME, DETAIL_TOOL_NAME, codeToSchemaMap.size(),
             cometLoader.isLoaded() ? "完成"
-                : (cometLoader.isLoadingInProgress() ? "加载中" : "未加载"),
-            SEARCH_TOOL_NAME);
+                : (cometLoader.isLoadingInProgress() ? "加载中" : "未加载"));
 
         ToolCallback unifiedTool = buildUnifiedTool();
         ToolCallback searchTool = buildSearchTool();
-        return new ToolCallback[] { unifiedTool, searchTool };
+        ToolCallback detailTool = buildDetailTool();
+        return new ToolCallback[] { unifiedTool, searchTool, detailTool };
     }
 
 
@@ -274,7 +277,8 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
      */
     private ToolCallback buildSearchTool() {
         String description = "搜索后端业务接口。根据关键词(如接口名、业务描述、功能名称)查找匹配的接口，"
-            + "返回接口编码(apiCode)和详细参数信息。找到准确的 apiCode 后再调用 invokeBusinessApi。";
+            + "返回接口编码(apiCode)和简要说明。找到准确的 apiCode 后，先调用 getApiDetail 获取该接口的完整参数，"
+            + "再调用 invokeBusinessApi 执行调用。";
 
         String inputSchemaJson = "{\"type\":\"object\",\"properties\":{"
             + "\"keywords\":{\"type\":\"string\",\"description\":\"搜索关键词，支持多个关键词用空格分隔，如：贷款 查询\"}"
@@ -369,9 +373,9 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
             }
         }
 
-        // 按分数降序排序，取前10
+        // 按分数降序排序，取前5（紧凑列表，详情按需通过 getApiDetail 获取）
         scored.sort((a, b) -> Integer.compare(b.score, a.score));
-        int limit = Math.min(scored.size(), 10);
+        int limit = Math.min(scored.size(), 5);
 
         if (scored.isEmpty()) {
             return "未找到匹配 \"" + keywords + "\" 的接口。请尝试其他关键词。";
@@ -390,6 +394,7 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
         if (scored.size() > limit) sb.append("，显示前 ").append(limit).append(" 个");
         sb.append(":\n\n");
 
+        // 紧凑列表：仅展示 apiCode / 接口名 / 描述，不展开参数树（参数详情由 getApiDetail 按需获取，节省 token）
         for (int i = 0; i < limit; i++) {
             ScoredResult r = scored.get(i);
             ApiParamSchema s = r.schema;
@@ -406,46 +411,161 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
             if (!r.whitelisted) {
                 sb.append(" 【不可调用：未在白名单】");
             }
-            sb.append("\n");
             if (s.remark() != null && !s.remark().isBlank()) {
-                sb.append("   描述: ").append(s.remark().replaceAll("\\s+", " ")).append("\n");
-            }
-            sb.append("   路径: ").append(s.url()).append("\n");
-
-            // 参数（全量展示，含类型、描述、取值范围）
-            List<FieldDef> required = s.inputs().stream()
-                .filter(FieldDef::required).toList();
-            List<FieldDef> optional = s.inputs().stream()
-                .filter(f -> !f.required()).toList();
-
-            if (!required.isEmpty()) {
-                sb.append("   必填参数: ");
-                sb.append(String.join(", ", required.stream()
-                    .map(this::formatParamField)
-                    .toList()));
-                sb.append("\n");
-            }
-            if (!optional.isEmpty()) {
-                sb.append("   可选参数: ");
-                sb.append(String.join(", ", optional.stream()
-                    .map(this::formatParamField)
-                    .toList()));
-                sb.append("\n");
+                sb.append("\n   描述: ").append(s.remark().replaceAll("\\s+", " "));
             }
             sb.append("\n");
         }
 
-        sb.append("确定可调用的 apiCode 后（仅 ✅ 标记的接口），请调用 invokeBusinessApi 工具执行实际接口调用。");
+        sb.append("\n确定要调用的接口后（仅 ✅ 标记的接口可调用），"
+            + "请先调用 getApiDetail 获取该接口的完整参数信息，再调用 invokeBusinessApi 执行调用。");
+        return sb.toString();
+    }
+
+    // ========== 接口详情工具 ==========
+
+    /**
+     * 构建接口详情工具 getApiDetail。
+     * <p>
+     * 根据 apiCode 返回单个接口的完整入参信息（必填/可选参数及类型、描述、取值范围、嵌套结构）。
+     * 在 searchBusinessApi 确定 apiCode 后、调用 invokeBusinessApi 之前使用。
+     * 相比在搜索结果中一次性返回多个接口的完整参数树，按需获取单接口详情可显著节省 token。
+     */
+    private ToolCallback buildDetailTool() {
+        String description = "获取指定接口的完整入参信息。根据 searchBusinessApi 搜索到的 apiCode，"
+            + "返回该接口的必填/可选参数（含类型、说明、取值范围、嵌套结构）。"
+            + "确定参数后再调用 invokeBusinessApi 执行调用。";
+
+        String inputSchemaJson = "{\"type\":\"object\",\"properties\":{"
+            + "\"apiCode\":{\"type\":\"string\",\"description\":\"接口编码，格式：{业务类名}_{方法名}，由 searchBusinessApi 搜索获得\"}"
+            + "},\"required\":[\"apiCode\"]}";
+
+        return new ToolCallback() {
+            @Override
+            public ToolDefinition getToolDefinition() {
+                return ToolDefinition.builder()
+                    .name(DETAIL_TOOL_NAME)
+                    .description(description)
+                    .inputSchema(inputSchemaJson)
+                    .build();
+            }
+
+            @Override
+            public String call(String argumentJson) {
+                try {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> args = objectMapper.readValue(argumentJson, Map.class);
+                    String apiCode = args != null ? (String) args.get("apiCode") : null;
+                    if (apiCode == null || apiCode.isBlank()) {
+                        return "请提供 apiCode 参数。可先调用 searchBusinessApi 搜索获取。";
+                    }
+                    return getApiDetailText(apiCode.trim());
+                } catch (Exception e) {
+                    log.error("getApiDetail failed: {}", e.getMessage(), e);
+                    return "查询接口详情失败，请稍后重试。";
+                }
+            }
+
+            @Override
+            public String call(String argumentJson, ToolContext toolContext) {
+                return call(argumentJson);
+            }
+        };
+    }
+
+    /**
+     * 格式化单个接口的完整参数详情（供 getApiDetail 使用）。
+     */
+    private String getApiDetailText(String apiCode) {
+        ApiParamSchema schema = findSchemaByApiCode(apiCode);
+        if (schema == null) {
+            return "未找到 apiCode \"" + apiCode + "\"。请先调用 searchBusinessApi 搜索正确的 apiCode。";
+        }
+
+        boolean whitelisted = codeToSchemaMap.containsKey(apiCode);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("接口: ").append(apiCode);
+        if (schema.apiName() != null && !schema.apiName().isBlank()) {
+            sb.append(" (").append(schema.apiName()).append(")");
+        }
+        if (!whitelisted) {
+            sb.append(" 【不可调用：未在白名单】");
+        }
+        sb.append("\n");
+        if (schema.remark() != null && !schema.remark().isBlank()) {
+            sb.append("描述: ").append(schema.remark().replaceAll("\\s+", " ")).append("\n");
+        }
+        sb.append("路径: ").append(schema.url()).append("\n");
+
+        // 参数（全量展示，含类型、描述、取值范围；数组/嵌套结构字段递归展开）
+        List<FieldDef> required = schema.inputs().stream()
+            .filter(FieldDef::required).toList();
+        List<FieldDef> optional = schema.inputs().stream()
+            .filter(f -> !f.required()).toList();
+
+        if (!required.isEmpty()) {
+            sb.append("必填参数:\n");
+            for (FieldDef f : required) {
+                sb.append(formatParamField(f, "  "));
+                sb.append("\n");
+            }
+        }
+        if (!optional.isEmpty()) {
+            sb.append("可选参数:\n");
+            for (FieldDef f : optional) {
+                sb.append(formatParamField(f, "  "));
+                sb.append("\n");
+            }
+        }
+
+        if (whitelisted) {
+            sb.append("\n请根据以上参数构造 params 后，调用 invokeBusinessApi 执行实际调用。");
+        } else {
+            sb.append("\n该接口未在白名单中，无法调用。如需调用请先添加 include-paths 白名单配置。");
+        }
         return sb.toString();
     }
 
     /**
-     * 格式化单个参数的展示文本：name(type) 描述 [取值范围: values]
+     * 按 apiCode 查找接口 Schema。
      * <p>
-     * 例：ccy(String(3)) 币种 [取值范围: D,I]
+     * 优先在白名单查找表 codeToSchemaMap 中查找；未命中时遍历全量已加载 Schema
+     * （含非白名单接口，用于展示详情并提示不可调用）。
      */
-    private String formatParamField(FieldDef f) {
-        StringBuilder sb = new StringBuilder(f.name());
+    private ApiParamSchema findSchemaByApiCode(String apiCode) {
+        ApiParamSchema schema = codeToSchemaMap.get(apiCode);
+        if (schema != null) return schema;
+        if (cometLoader != null) {
+            for (ApiParamSchema s : cometLoader.getAllSchemas().values()) {
+                if (apiCode.equals(buildApiCode(s))) return s;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 递归格式化字段树：name(type) 描述 [取值范围: values]
+     * <p>
+     * 数组项或其他嵌套结构中的子字段以缩进层级递归展示。例：
+     * <pre>
+     * - rateArray(List) 利率数组
+     *     - ccy(String(3)) 币种 [取值范围: D,I]
+     *     - rate(BigDecimal) 利率
+     * </pre>
+     *
+     * @param f     字段定义
+     * @param indent 每行前缀缩进（由调用方传入，保证多行对齐）
+     */
+    private String formatParamField(FieldDef f, String indent) {
+        StringBuilder sb = new StringBuilder();
+        appendFieldTree(sb, f, indent, "");
+        return sb.toString();
+    }
+
+    /** 递归追加字段行及其嵌套子字段 */
+    private void appendFieldTree(StringBuilder sb, FieldDef f, String baseIndent, String relIndent) {
+        sb.append(baseIndent).append(relIndent).append("- ").append(f.name());
         if (f.type() != null && !f.type().isBlank()) {
             sb.append("(").append(f.type()).append(")");
         }
@@ -455,7 +575,13 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
         if (f.validValues() != null && !f.validValues().isBlank()) {
             sb.append(" [取值范围: ").append(f.validValues()).append("]");
         }
-        return sb.toString();
+        if (f.children() != null && !f.children().isEmpty()) {
+            String childRel = relIndent + "    ";
+            for (FieldDef child : f.children()) {
+                sb.append("\n");
+                appendFieldTree(sb, child, baseIndent, childRel);
+            }
+        }
     }
 
     /** 搜索结果条目 */
@@ -483,14 +609,14 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
     private String buildUnifiedDescription() {
         return "调用后端业务接口（POST）。通过 apiCode 选择要调用的接口，"
             + "在 params 中传入该接口的业务参数（即报文 body 内容）。\n\n"
-            + "**重要：如果不确定使用哪个 apiCode，必须先调用 searchBusinessApi 工具搜索接口，"
-            + "找到准确的 apiCode 后再调用本工具。**\n\n"
+            + "**使用流程：不确定 apiCode 时 → 调用 searchBusinessApi 搜索接口 → 调用 getApiDetail 获取该接口的完整参数 → 调用本工具执行调用。**\n\n"
             + "**重要规则：根据问题确定唯一的 apiCode 后只调用一次，不要遍历多个接口。**\n\n"
             + "使用说明:\n"
             + "1. 不确定用哪个 apiCode 时，先调用 searchBusinessApi 搜索\n"
-            + "2. 确定 apiCode 后，在 params 中传入对应的业务参数\n"
-            + "3. 如果不需要参数，可不传 params 或传空对象 {}\n"
-            + "4. **调用成功后直接根据返回数据回答用户，禁止继续调用其他接口**";
+            + "2. 搜索到 apiCode 后，调用 getApiDetail 获取该接口的完整参数信息\n"
+            + "3. 根据参数要求，在 params 中传入对应的业务参数\n"
+            + "4. 如果不需要参数，可不传 params 或传空对象 {}\n"
+            + "5. **调用成功后直接根据返回数据回答用户，禁止继续调用其他接口**";
     }
 
     // ========== 紧凑入参 JSON Schema 生成 ==========
@@ -518,7 +644,7 @@ public class DynamicToolRegistrar implements ToolCallbackProvider {
         Map<String, Object> apiCodeProp = new LinkedHashMap<>();
         apiCodeProp.put("type", "string");
         apiCodeProp.put("description",
-            "接口编码，格式：{业务类名}_{方法名}。请先调用 searchBusinessApi 搜索获取准确的 apiCode。");
+            "接口编码，格式：{业务类名}_{方法名}。请先调用 searchBusinessApi 搜索获取 apiCode，再用 getApiDetail 查看该接口的完整参数。");
         properties.put("apiCode", apiCodeProp);
 
         // params 字段

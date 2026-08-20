@@ -65,23 +65,13 @@ public class HttpForwarder {
      */
     public String forwardPost(String apiPath, Map<String, Object> params,
                               List<FieldDef> inputFields, String apiCode) {
-        // 必输字段校验（从字段定义推导必输字段名）
-        List<String> requiredFields = inputFields != null
-            ? inputFields.stream().filter(FieldDef::required).map(FieldDef::name).toList()
-            : List.of();
-        if (!requiredFields.isEmpty()) {
-            List<String> missing = new ArrayList<>();
-            for (String field : requiredFields) {
-                if (params == null || !params.containsKey(field) || params.get(field) == null) {
-                    missing.add(field);
-                }
-            }
-            if (!missing.isEmpty()) {
-                return "错误: 缺少必输参数 [" + String.join(", ", missing) + "]。请提供这些参数后重试。";
-            }
+        // 必输字段校验（含数组/嵌套结构的子字段，递归）
+        if (inputFields != null) {
+            String requiredError = validateRequiredFields(params, inputFields);
+            if (requiredError != null) return requiredError;
         }
 
-        // 取值范围校验（仅顶层字段）
+        // 取值范围校验（含数组/嵌套结构的子字段，递归）
         if (inputFields != null && params != null) {
             String rangeError = validateValueRanges(params, inputFields);
             if (rangeError != null) return rangeError;
@@ -113,14 +103,15 @@ public class HttpForwarder {
 
             String response = restTemplate.postForObject(url, requestPayload, String.class);
 
-            // 响应报文需 pretty 格式化后返回给 LLM（序列化成本无法省），但完整报文仅 debug 时写日志
-            String prettyResponse = prettyPrintJson(response);
+            // 响应报文以紧凑 JSON 返回给 LLM（紧凑格式相比 pretty 格式可省约 30-50% token），
+            // 完整报文仅 debug 时以 pretty 格式写日志
+            String compactResponse = compactJson(response);
             if (log.isDebugEnabled()) {
-                log.debug("▶ 响应报文 [{}]:\n{}", apiPath, prettyResponse);
+                log.debug("▶ 响应报文 [{}]:\n{}", apiPath, prettyPrintJson(response));
             }
-            log.info("▶ 调用完成 [{}]: 响应 {} 字符", apiPath, prettyResponse.length());
+            log.info("▶ 调用完成 [{}]: 响应 {} 字符", apiPath, compactResponse.length());
 
-            return prettyResponse + "\n\n---\n接口调用成功。以上是完整返回数据，请直接回答用户，**不要继续调用其他接口**。";
+            return compactResponse + "\n\n---\n接口调用成功。以上是完整返回数据，请直接回答用户，**不要继续调用其他接口**。";
         } catch (Exception e) {
             log.error("Unified forward failed: POST {} - {}", url, e.getMessage(), e);
             return "调用接口 " + apiPath + " 失败: " + resolveUserMessage(e);
@@ -144,49 +135,153 @@ public class HttpForwarder {
         return "请求处理失败: " + msg;
     }
 
+    // ========== 必输字段校验 ==========
+
+    /**
+     * 校验必输字段是否齐全（含数组/嵌套结构的子字段，递归）。
+     * <p>
+     * 对每一层：缺失的必输字段一次性收集并提示；本层无缺失时递归检查已提供字段的嵌套子字段。
+     * 错误信息中的参数名带完整路径（如 rateArray[0].ccy），便于定位。
+     *
+     * @param params      业务参数（可为 null，视为空参数）
+     * @param inputFields 入参字段定义列表
+     * @return 缺失必输参数的错误提示，全部齐全时返回 null
+     */
+    private String validateRequiredFields(Map<String, Object> params, List<FieldDef> inputFields) {
+        return checkRequired(params != null ? params : Map.of(), inputFields, "");
+    }
+
+    /** 递归检查一层字段集合（顶层或任意嵌套层）的必输完整性 */
+    private String checkRequired(Map<String, Object> params, List<FieldDef> fields, String pathPrefix) {
+        if (fields == null || fields.isEmpty()) return null;
+
+        // 1) 收集本层缺失的必输字段
+        List<String> missing = new ArrayList<>();
+        for (FieldDef field : fields) {
+            if (!field.required()) continue;
+            if (!params.containsKey(field.name()) || params.get(field.name()) == null) {
+                missing.add(pathPrefix + field.name());
+            }
+        }
+        if (!missing.isEmpty()) {
+            return "错误: 缺少必输参数 [" + String.join(", ", missing) + "]。请提供这些参数后重试。";
+        }
+
+        // 2) 递归检查已提供字段的嵌套子字段
+        for (FieldDef field : fields) {
+            if (field.children() == null || field.children().isEmpty()) continue;
+            if (!params.containsKey(field.name()) || params.get(field.name()) == null) continue;
+
+            Object value = params.get(field.name());
+            if (value instanceof Map<?, ?> map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> childParams = (Map<String, Object>) map;
+                String err = checkRequired(childParams, field.children(), pathPrefix + field.name() + ".");
+                if (err != null) return err;
+            } else if (value instanceof List<?> list) {
+                for (int i = 0; i < list.size(); i++) {
+                    Object item = list.get(i);
+                    if (item instanceof Map<?, ?> map) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> childParams = (Map<String, Object>) map;
+                        String err = checkRequired(childParams, field.children(), pathPrefix + field.name() + "[" + i + "].");
+                        if (err != null) return err;
+                    }
+                    // 标量元素无子字段，跳过
+                }
+            }
+        }
+        return null;
+    }
+
     // ========== 取值范围校验 ==========
 
     /**
-     * 校验参数值是否在字段允许的取值范围内（仅顶层字段）。
+     * 校验参数值是否在字段允许的取值范围内（含数组/嵌套结构的子字段，递归）。
      * <p>
      * 取值范围格式为逗号分隔枚举（如 "D,I"、"01,02"）。
-     * 标量值直接匹配；List 值逐元素匹配；Map 值跳过（嵌套对象不属于顶层字段校验范围）。
+     * 校验规则：
+     * <ul>
+     *   <li>标量值直接匹配字段自身的取值范围</li>
+     *   <li>List 值：元素为标量时逐元素匹配字段自身枚举；元素为对象时按子字段递归校验</li>
+     *   <li>Map/对象值：按子字段递归校验</li>
+     * </ul>
      *
      * @param params      业务参数
      * @param inputFields 入参字段定义列表
      * @return 校验失败的错误提示，全部通过时返回 null
      */
     private String validateValueRanges(Map<String, Object> params, List<FieldDef> inputFields) {
-        for (FieldDef field : inputFields) {
-            String valid = field.validValues();
-            if (valid == null || valid.isBlank()) continue;
+        return validateFieldList(params, inputFields, "");
+    }
+
+    /** 递归校验一层字段集合（顶层或任意嵌套层）的取值 */
+    private String validateFieldList(Map<String, Object> params, List<FieldDef> fields, String pathPrefix) {
+        if (params == null || fields == null || fields.isEmpty()) return null;
+        for (FieldDef field : fields) {
             if (!params.containsKey(field.name()) || params.get(field.name()) == null) continue;
+            String path = pathPrefix + field.name();
+            String err = validateField(field, params.get(field.name()), path);
+            if (err != null) return err;
+        }
+        return null;
+    }
 
+    /**
+     * 校验单个字段的值：先校验字段自身取值范围，再递归校验嵌套子字段。
+     *
+     * @param field 字段定义
+     * @param value 参数值
+     * @param path  字段完整路径（如 rateArray[0].ccy），用于错误提示定位
+     */
+    private String validateField(FieldDef field, Object value, String path) {
+        // 1) 字段自身的取值范围
+        String valid = field.validValues();
+        if (valid != null && !valid.isBlank()) {
             Set<String> allowed = parseValidValues(valid);
-            if (allowed.isEmpty()) continue;
-
-            Object value = params.get(field.name());
-            if (value instanceof List<?> list) {
-                for (Object item : list) {
-                    if (item == null) continue;
-                    if (!allowed.contains(String.valueOf(item).trim())) {
-                        return buildRangeError(field, valid, allowed, String.valueOf(item));
+            if (!allowed.isEmpty()) {
+                if (value instanceof List<?> list) {
+                    for (Object item : list) {
+                        if (item == null || item instanceof Map) continue;  // 对象元素不参与自身枚举
+                        if (!allowed.contains(String.valueOf(item).trim())) {
+                            return buildRangeError(path, valid, allowed, String.valueOf(item));
+                        }
+                    }
+                } else if (!(value instanceof Map)) {
+                    String s = String.valueOf(value).trim();
+                    if (!allowed.contains(s)) {
+                        return buildRangeError(path, valid, allowed, s);
                     }
                 }
-            } else if (!(value instanceof Map)) {
-                String s = String.valueOf(value).trim();
-                if (!allowed.contains(s)) {
-                    return buildRangeError(field, valid, allowed, s);
+                // Map 值对字段自身的枚举不适用（对象类型字段一般不配 scope）
+            }
+        }
+
+        // 2) 递归校验嵌套子字段
+        if (field.children() != null && !field.children().isEmpty()) {
+            if (value instanceof Map<?, ?> map) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> childParams = (Map<String, Object>) map;
+                return validateFieldList(childParams, field.children(), path + ".");
+            } else if (value instanceof List<?> list) {
+                for (int i = 0; i < list.size(); i++) {
+                    Object item = list.get(i);
+                    if (item instanceof Map<?, ?> map) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> childParams = (Map<String, Object>) map;
+                        String err = validateFieldList(childParams, field.children(), path + "[" + i + "].");
+                        if (err != null) return err;
+                    }
+                    // 标量元素不参与子字段递归（无法按字段名映射）
                 }
             }
-            // Map 值跳过（嵌套对象不属于顶层字段校验范围）
         }
         return null;
     }
 
     /** 构造取值范围校验失败的错误提示 */
-    private String buildRangeError(FieldDef field, String valid, Set<String> allowed, String actualValue) {
-        return "错误: 参数 [" + field.name() + "] 的值 '" + actualValue
+    private String buildRangeError(String path, String valid, Set<String> allowed, String actualValue) {
+        return "错误: 参数 [" + path + "] 的值 '" + actualValue
             + "' 不在允许范围 [" + valid + "] 内，请使用: " + String.join(", ", allowed) + "。";
     }
 
@@ -502,6 +597,21 @@ public class HttpForwarder {
         try {
             Object json = objectMapper.readValue(raw, Object.class);
             return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(json);
+        } catch (Exception e) {
+            return raw;  // 不是 JSON 就原样返回
+        }
+    }
+
+    /**
+     * 将 JSON 字符串紧凑化（去除空白/缩进），解析失败时原样返回。
+     * <p>
+     * 紧凑 JSON 相比 pretty 格式可减少 30-50% 的 token 占用，LLM 可正常解析。
+     */
+    private String compactJson(String raw) {
+        if (raw == null) return "null";
+        try {
+            Object json = objectMapper.readValue(raw, Object.class);
+            return objectMapper.writeValueAsString(json);
         } catch (Exception e) {
             return raw;  // 不是 JSON 就原样返回
         }
